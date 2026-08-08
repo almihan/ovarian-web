@@ -1,0 +1,112 @@
+# --------------------------------------------------
+# Environment variables and secrets
+# --------------------------------------------------
+.env
+.env.*
+!.env.example
+
+secrets/
+credentials.json
+*.pem
+*.key
+
+# --------------------------------------------------
+# Python
+# --------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+ENV/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# --------------------------------------------------
+# Application runtime data
+# --------------------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+data/database.sqlite*
+
+data/papers/*
+!data/papers/.gitkeep
+
+data/results/*
+!data/results/.gitkeep
+
+data/model_cache/*
+!data/model_cache/.gitkeep
+
+# Downloaded or generated files
+uploads/
+downloads/
+tmp/
+temp/
+*.log
+
+# --------------------------------------------------
+# Hugging Face / machine-learning caches
+# --------------------------------------------------
+.cache/
+huggingface_cache/
+transformers_cache/
+
+# --------------------------------------------------
+# Optional Node/Vite frontend files
+# --------------------------------------------------
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --------------------------------------------------
+# Editors and operating systems
+# --------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# --------------------------------------------------
+# Local development and deployment artifacts
+# --------------------------------------------------
+*.pid
+*.pid.lock
+railway.json.local
