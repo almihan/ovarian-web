@@ -50,6 +50,7 @@ _NODE_COLORS = {
 _NEGATIVE = {"inhibition", "downregulation"}
 _EDGE_COLORS = {
     "binding": "#4F72B8",
+    "biosynthesis": "#7A63B8",
     "secreted": "#2D8C87",
 }
 _ONE_MIB = 1024 * 1024
@@ -191,7 +192,6 @@ def _edge_payload(edge: Mapping[str, Any]) -> dict[str, Any]:
         # Show the biological predicate directly on the interaction edge.
         "label": predicate,
         "predicate": predicate,
-        "directed": directed,
         "edge_kind": "interaction",
         "title": _edge_title(edge),
         "paper_count": paper_count,
