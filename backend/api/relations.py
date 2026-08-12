@@ -161,7 +161,6 @@ def relation_pipeline_status() -> dict[str, Any]:
         "max_request_retries": settings.relation_max_request_retries,
         "prompt_caching": "best-effort repeated-prefix caching",
         "prompt_cache_shards": settings.relation_prompt_cache_shards,
-        "biosynthesis_enabled": settings.relation_enable_biosynthesis,
         "hormone_gene_cell_context_required": (
             settings.relation_require_hormone_gene_cell_context
         ),
@@ -273,7 +272,6 @@ def submit_relation(payload: RelationCreate) -> dict[str, Any]:
             "request_timeout_seconds": settings.relation_request_timeout_seconds,
             "max_request_retries": settings.relation_max_request_retries,
             "prompt_cache_shards": settings.relation_prompt_cache_shards,
-            "biosynthesis_enabled": settings.relation_enable_biosynthesis,
             "cell_context_required": (
                 settings.relation_require_hormone_gene_cell_context
             ),

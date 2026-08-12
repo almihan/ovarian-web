@@ -139,6 +139,7 @@ input[type="search"]:focus, input[type="number"]:focus { border-color: #4b9d85; 
 .edge-swatch { width: 21px; height: 3px; border-radius: 3px; }
 .edge-swatch.positive { background: #2f8b68; }
 .edge-swatch.negative { background: var(--red); }
+.edge-swatch.binding { background: #4f72b8; }
 .legend code { padding: 1px 4px; border-radius: 4px; background: #eef3f6; font-size: 10px; }
 .explorer-help { margin-top: 14px; padding: 13px; border-radius: 10px; background: #f8fafb; color: var(--muted); }
 .explorer-help strong { color: var(--ink); font-size: 12px; }

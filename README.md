@@ -68,7 +68,7 @@ No stage starts automatically.
    - becomes available after a completed Stage 2 result is selected;
    - reads at most 500 rows per local window and sends only eligible tagged chunks;
    - runs online Responses calls asynchronously with bounded concurrency;
-   - extracts activation, inhibition, proliferation, secretion, production,
+   - extracts activation, inhibition, proliferation, merged secretion/production,
      binding, upregulation, and downregulation;
    - records explicit cell context for hormone-gene relations;
    - publishes `relations.jsonl.gz` plus a token/cache/provenance summary.
@@ -76,8 +76,8 @@ No stage starts automatically.
    - becomes available after a completed Stage 3 result is selected;
    - streams the relation artifact together with its aligned Stage 1 passages;
    - converts chunk-local `C#`, `G#`, and `H#` tags into deterministic global nodes;
-   - aggregates directed relations, paper/chunk counts, evidence, and hormone-gene
-     cell contexts into SQLite;
+   - aggregates directed relations, undirected binding edges, paper/chunk counts,
+     evidence, and hormone-gene cell contexts into SQLite;
    - opens a separate explorer page immediately and shows Stage 4 build progress;
    - loads a bounded initial graph, then searches and adds selected node
      neighbourhoods without replacing the current browser graph;
@@ -183,19 +183,18 @@ its context are retained.
 | `activation` | `G -> C`, `H -> C`, `H -> G` |
 | `inhibition` | `G -> C`, `H -> C`, `H -> G` |
 | `proliferation` | `G -> C`, `H -> C` |
-| `secreted` | `C -> G`, `C -> H` |
-| `production` | `C -> H` |
-| `binding` | `H -> G` |
+| `secreted` | `C -> G`; for `C -> H`, includes secretion, release, production, generation, and synthesis |
+| `binding` | predicted as `H -> G`; displayed as undirected `H -- G` in the network |
 | `upregulation` | `H -> G` |
 | `downregulation` | `H -> G` |
-| `biosynthesis` | `G -> H`; implemented but disabled by default |
 
 `G -> G`, `C -> C`, self-relations, `C secreted C`, `H secreted C`,
-`G secreted C`, and every other unlisted combination are rejected locally even
-if a model attempts to return them. Hormone-gene relations include a
-`cell_context` array containing only explicitly linked `C#` entities. The default
-keeps an otherwise explicit hormone-gene relation with an empty array when no
-cell is explicit; strict mode can discard it.
+`G secreted C`, reversed `G binding H`, and every other unlisted combination are
+rejected locally. Hormone-gene relations include a `cell_context` array containing
+only explicitly linked `C#` entities. The default keeps an otherwise explicit
+hormone-gene relation with an empty array when no cell is explicit; strict mode
+can discard it. Stage 4 removes the arrow from binding edges without changing the
+Stage 3 relation record.
 
 ```json
 {
@@ -461,7 +460,6 @@ RELATION_PROGRESS_UPDATE_EVERY=5
 RELATION_REASONING_EFFORT=none
 RELATION_PROMPT_CACHE_KEY=ovarian-relations-v4
 RELATION_PROMPT_CACHE_SHARDS=32
-RELATION_ENABLE_BIOSYNTHESIS=false
 RELATION_REQUIRE_HORMONE_GENE_CELL_CONTEXT=false
 
 # Stage 4 bounded browser/index settings.
@@ -573,7 +571,6 @@ RELATION_MAX_OUTPUT_TOKENS=1200
 RELATION_REASONING_EFFORT=none
 RELATION_PROMPT_CACHE_KEY=ovarian-relations-v4
 RELATION_PROMPT_CACHE_SHARDS=32
-RELATION_ENABLE_BIOSYNTHESIS=false
 RELATION_REQUIRE_HORMONE_GENE_CELL_CONTEXT=false
 
 NETWORK_INITIAL_NODES=120

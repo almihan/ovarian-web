@@ -25,7 +25,6 @@ def test_exact_relation_direction_matrix() -> None:
         ("H1", "proliferation", "C1"),
         ("C1", "secreted", "G1"),
         ("C1", "secreted", "H1"),
-        ("C1", "production", "H1"),
         ("H1", "binding", "G1"),
         ("H1", "upregulation", "G1"),
         ("H1", "downregulation", "G1"),
@@ -43,26 +42,16 @@ def test_exact_relation_direction_matrix() -> None:
                     f"{object_[0]}1",
                 )
                 expected = canonical in allowed and subject != object_
-                assert relation_allowed(
-                    subject,
-                    predicate,
-                    object_,
-                    enable_biosynthesis=False,
-                ) is expected
+                assert relation_allowed(subject, predicate, object_) is expected
 
-    assert not relation_allowed("G1", "activation", "G2", enable_biosynthesis=False)
-    assert not relation_allowed("C1", "activation", "C2", enable_biosynthesis=False)
-    assert not relation_allowed("C1", "secreted", "C2", enable_biosynthesis=False)
-    assert not relation_allowed("H1", "secreted", "C1", enable_biosynthesis=False)
-    assert not relation_allowed("G1", "secreted", "C1", enable_biosynthesis=False)
-
-
-def test_biosynthesis_is_available_only_when_enabled() -> None:
-    assert not relation_allowed(
-        "G1", "biosynthesis", "H1", enable_biosynthesis=False
-    )
-    assert relation_allowed("G1", "biosynthesis", "H1", enable_biosynthesis=True)
-    assert not relation_allowed("H1", "biosynthesis", "G1", enable_biosynthesis=True)
+    assert not relation_allowed("G1", "activation", "G2")
+    assert not relation_allowed("C1", "activation", "C2")
+    assert not relation_allowed("C1", "secreted", "C2")
+    assert not relation_allowed("H1", "secreted", "C1")
+    assert not relation_allowed("G1", "secreted", "C1")
+    assert not relation_allowed("C1", "production", "H1")
+    assert not relation_allowed("G1", "binding", "H1")
+    assert not relation_allowed("G1", "unsupported", "H1")
 
 
 def test_cache_shards_scale_down_for_small_and_retry_windows() -> None:
@@ -135,7 +124,6 @@ def test_prepare_chunk_adds_cell_gene_and_hormone_tags_and_reuses_ids() -> None:
         row_index=7,
         source_row={**annotation_row, "chunk": text},
         annotation_row=annotation_row,
-        enable_biosynthesis=False,
     )
 
     assert prepared.custom_id == "r-0000000007"
@@ -185,7 +173,6 @@ def test_gene_and_protein_labels_reuse_one_normalized_g_tag() -> None:
         row_index=0,
         source_row={"chunk": text},
         annotation_row={"annotations": annotations},
-        enable_biosynthesis=False,
     )
     assert set(prepared.entities) == {"C1", "G1"}
     assert prepared.tagged_text.count("[G1]") == 2
@@ -231,12 +218,29 @@ def test_sanitizer_enforces_matrix_and_cell_context() -> None:
                 "object": "H1",
                 "cell_context": ["C2"],
             },
+            {
+                "subject": "H1",
+                "predicate": "binding",
+                "object": "G1",
+                "cell_context": ["C1"],
+            },
+            {
+                "subject": "C1",
+                "predicate": "production",
+                "object": "H1",
+                "cell_context": [],
+            },
+            {
+                "subject": "G1",
+                "predicate": "binding",
+                "object": "H1",
+                "cell_context": ["C1"],
+            },
         ]
     }
     cleaned = sanitize_triples(
         parsed,
         entities=entities,
-        enable_biosynthesis=False,
         require_hormone_gene_cell_context=False,
     )
 
@@ -247,13 +251,18 @@ def test_sanitizer_enforces_matrix_and_cell_context() -> None:
         ("H1", "upregulation", "G1"),
         ("G1", "activation", "C1"),
         ("C1", "secreted", "H1"),
+        ("H1", "binding", "G1"),
     }
-    hg = next(item for item in cleaned if item["subject"] == "H1")
-    assert hg["cell_context"] == ["C2"]
+    upregulation = next(
+        item for item in cleaned if item["predicate"] == "upregulation"
+    )
+    binding = next(item for item in cleaned if item["predicate"] == "binding")
+    assert upregulation["cell_context"] == ["C2"]
+    assert binding["cell_context"] == ["C1"]
     assert all(
         item["cell_context"] == []
         for item in cleaned
-        if item["subject"] != "H1"
+        if item["predicate"] not in {"upregulation", "binding"}
     )
 
 
@@ -276,7 +285,6 @@ def test_strict_hormone_gene_context_mode_discards_contextless_relation() -> Non
     assert sanitize_triples(
         parsed,
         entities=entities,
-        enable_biosynthesis=False,
         require_hormone_gene_cell_context=True,
     ) == []
 
@@ -305,7 +313,6 @@ def test_online_request_is_compact_structured_and_cache_sharded() -> None:
         max_output_tokens=1200,
         reasoning_effort="none",
         cache_key=cache_key,
-        enable_biosynthesis=False,
     )
 
     assert body["model"] == "gpt-5.4-nano"
@@ -314,23 +321,30 @@ def test_online_request_is_compact_structured_and_cache_sharded() -> None:
     assert prepared.tagged_text in body["input"]
     assert body["text"]["format"]["strict"] is True
     assert body["text"]["format"]["schema"]["additionalProperties"] is False
+    predicates = body["text"]["format"]["schema"]["properties"]["triples"][
+        "items"
+    ]["properties"]["predicate"]["enum"]
+    assert "production" not in predicates
+    assert "binding" in predicates
+    assert "binding: H -> G" in SYSTEM_INSTRUCTIONS
+    assert "releases, produces, generates, synthesizes" in SYSTEM_INSTRUCTIONS
+    assert "undirected" not in SYSTEM_INSTRUCTIONS.casefold()
     assert len(body["prompt_cache_key"]) <= 64
     assert body["prompt_cache_key"] == cache_key
-    # Keep ample static-prefix headroom before the changing chunk so automatic
-    # caching can start on repeated instructions rather than variable text.
-    assert len(SYSTEM_INSTRUCTIONS) >= 9_000
+    # Keep the static prefix large enough for prompt caching without retaining
+    # repetitive instructions that add cost and distract the extraction model.
+    assert 3_500 <= len(SYSTEM_INSTRUCTIONS) <= 6_000
 
 
-def test_request_body_does_not_enable_biosynthesis_by_default() -> None:
+def test_request_body_excludes_unsupported_predicates() -> None:
     body = request_body(
         tagged_text="[G1]CYP19A1[/G1] affects [H1]estradiol[/H1].",
         model="gpt-5.4-nano",
         max_output_tokens=1200,
         reasoning_effort="none",
         cache_key="cache-key",
-        enable_biosynthesis=False,
     )
     predicates = body["text"]["format"]["schema"]["properties"]["triples"][
         "items"
     ]["properties"]["predicate"]["enum"]
-    assert "biosynthesis" not in predicates
+    assert "unsupported" not in predicates

@@ -15,21 +15,19 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
-RELATION_PIPELINE_VERSION = "ovarian-openai-online-relations-v6-stage2-human-genes"
+RELATION_PIPELINE_VERSION = "ovarian-openai-online-relations-v1"
 RELATION_OUTPUT_SCHEMA = "chunk-biological-relations-v1"
-PROMPT_VERSION = "ovarian-relations-prompt-v4"
+PROMPT_VERSION = "ovarian-relations-prompt-v1"
 
 BASE_PREDICATES: tuple[str, ...] = (
     "activation",
     "inhibition",
     "proliferation",
     "secreted",
-    "production",
     "binding",
     "upregulation",
     "downregulation",
 )
-OPTIONAL_PREDICATE = "biosynthesis"
 CACHE_TARGET_REQUESTS_PER_SHARD = 15
 
 ENTITY_PREFIX = {"cell": "C", "gene": "G", "protein": "G", "hormone": "H"}
@@ -44,99 +42,64 @@ _CELL_ID_RE = re.compile(r"^C\d+$")
 SYSTEM_INSTRUCTIONS = """
 You extract only explicit biological relations between tagged entities in ovarian biomedical text.
 
-Native tags:
-- [C1]...[/C1] is a cell or cell-type entity.
-- [G1]...[/G1] is a gene or protein entity.
-- [H1]...[/H1] is a hormone entity.
-The numeric IDs are local to this chunk. Use only IDs visible in the supplied tagged text.
+Tags:
+- [C1]...[/C1]: cell or cell type
+- [G1]...[/G1]: gene or protein
+- [H1]...[/H1]: hormone
+IDs are local to the supplied chunk. Use only visible IDs.
 
-Return one JSON object with a single key, "triples". Each triple has exactly:
-- subject: a visible entity ID
-- predicate: one allowed predicate
-- object: a visible entity ID
-- cell_context: an array of visible C IDs
+Return one JSON object with the key "triples". Each triple contains exactly:
+- subject: visible entity ID
+- predicate: allowed predicate
+- object: visible entity ID
+- cell_context: array of visible C IDs
 
-Extract a relation only when the chunk explicitly states it. Do not add relations from background knowledge, typical biology, correlation alone, co-occurrence, an experimental hypothesis, or a result reported only in another cited paper. Preserve semantic direction, including passive voice. Resolve abbreviations, aliases, appositions, treatment names, pronouns, and cross-sentence references only when the chunk itself makes the reference clear.
+Extract only relations explicitly asserted in the chunk. Do not infer from background knowledge, typical biology, co-occurrence, correlation, an experimental aim, or a cited result not stated in the supplied text. Respect negation, uncertainty, comparison, attribution, passive voice, and cross-sentence references. Prefer no relation over a weak inference.
 
-Allowed predicate and direction matrix:
-1. activation: G -> C, H -> C, or H -> G. Use for explicit activation, stimulation, induction, triggering, or promotion of cell behavior or gene/protein function. For H -> G, use upregulation instead when the claim is specifically about expression, transcription, translation, or abundance.
-2. inhibition: G -> C, H -> C, or H -> G. Use for explicit inhibition, blockade, suppression, prevention, attenuation, or impairment of cell behavior or gene/protein function. For H -> G, use downregulation instead when the claim is specifically about expression, transcription, translation, or abundance.
-3. proliferation: G -> C or H -> C. Use only when the object cell population explicitly proliferates, divides, expands, grows in cell number, or undergoes mitosis. Do not use it merely because a molecular level increased.
-4. secreted: C -> G or C -> H. Use only when a cell explicitly secretes, releases, exports, or is the stated cellular source of the gene/protein product or hormone.
-5. production: C -> H. Use when a cell explicitly produces, generates, synthesizes, or is the stated source of a hormone. Prefer secreted when release/secretion is the claim; prefer production when synthesis/production is the claim.
-6. binding: H -> G. Use only for explicit binding, receptor engagement, ligand-receptor association, or direct interaction in which the hormone is the subject and a gene/protein is the object.
-7. upregulation: H -> G. Use only when the hormone explicitly increases expression, abundance, transcription, or translation of the gene/protein.
-8. downregulation: H -> G. Use only when the hormone explicitly decreases expression, abundance, transcription, or translation of the gene/protein.
-9. biosynthesis may be available only when it appears in the response schema. Its direction is G -> H and it requires an explicit statement that a gene/protein promotes, controls, catalyzes, or is required for biosynthesis of the hormone.
+Allowed predicates and directions:
+1. activation: G -> C, H -> C, or H -> G. Use for explicit activation, stimulation, induction, triggering, or promotion of cell behavior or gene/protein function. For H -> G expression or abundance changes, use upregulation instead.
+2. inhibition: G -> C, H -> C, or H -> G. Use for explicit inhibition, blockade, suppression, prevention, attenuation, or impairment. For H -> G expression or abundance changes, use downregulation instead.
+3. proliferation: G -> C or H -> C. Use only when the tagged cell population explicitly proliferates, divides, expands in cell number, or undergoes mitosis.
+4. secreted: C -> G or C -> H. For C -> G, require explicit secretion, release, or export. For C -> H, use secreted when the cell explicitly secretes, releases, produces, generates, synthesizes, or is identified as the cellular source of the hormone.
+5. binding: H -> G. Use only for explicit binding, receptor engagement, ligand-receptor association, or direct physical interaction.
+6. upregulation: H -> G. Use only when the hormone explicitly increases expression, transcription, translation, or abundance of the gene/protein.
+7. downregulation: H -> G. Use only when the hormone explicitly decreases expression, transcription, translation, or abundance of the gene/protein.
 
-Hard prohibitions:
-- Never output G -> G.
-- Never output C -> C.
-- Never output a direction or predicate combination outside the matrix.
+Validation rules:
+- Never output G -> G, C -> C, self-relations, or a predicate-direction combination outside the matrix.
 - Never output C secreted C, H secreted C, or G secreted C.
-- Do not reinterpret a measured change in expression, concentration, staining, density, or abundance as secretion unless cellular secretion/release is explicit.
-- Do not output self-relations or duplicate triples.
-- Return at most 50 unique triples. Prefer omission over a weak or inferred relation.
+- A measured change in concentration, staining, density, expression, or abundance is not secretion unless the tagged cell is explicitly identified as the source.
+- Shared pathway membership, treatment response, or statistical association is not binding.
+- A change in activation, differentiation, viability, migration, morphology, follicle size, tumor mass, or marker intensity is not automatically proliferation.
+- Emit each semantic relation once and return at most 50 unique triples.
 
-Apply this decision procedure to every candidate relation:
-1. Find an explicit relation trigger in the supplied chunk. A tag pair without a trigger is not a relation.
-2. Determine the semantic cause/source and affected target from the wording, not simply from left-to-right order. Passive voice, nominalizations, and coordinated clauses can reverse or share grammatical roles.
-3. Confirm that both endpoints are tagged and that their C, G, or H types match one allowed direction for the selected predicate.
-4. Choose the most specific predicate supported by the wording. Expression or abundance changes for H -> G use upregulation or downregulation; cell-number expansion uses proliferation; physical ligand/receptor association uses binding; cellular release uses secreted; cellular hormone synthesis uses production.
-5. For a hormone-gene relation, inspect the whole chunk for an explicitly linked tagged cell context. Do not borrow a cell from an unrelated sentence or experimental group.
-6. Recheck negation, speculation, comparison, and attribution. A relation that is denied, merely proposed, used as a future aim, or attributed only to unprovided background literature is not an asserted relation in this chunk.
-7. Emit each semantic relation once. Coordinated subjects or objects may create multiple triples only when the same explicit trigger genuinely applies to each tagged endpoint.
+Cell context:
+- For H -> G relations, include every tagged C entity explicitly identified as the cell in which the relation occurs.
+- Do not use a nearby cell mention unless the wording links it to that hormone-gene relation.
+- If the relation is explicit but no tagged cell context is linked, return an empty array.
+- For all other relations, return an empty cell_context array.
 
-Predicate boundary rules:
-- Activation and inhibition describe functional effects. Do not replace them with upregulation or downregulation unless H -> G expression, transcription, translation, or abundance is the stated effect.
-- Proliferation always points to the tagged cell undergoing increased division or cell-number expansion. A change in cell activation, differentiation, viability, migration, morphology, follicle size, tumor mass, or marker intensity is not automatically proliferation.
-- Secreted requires release or export from a tagged cell. Detection of a hormone or protein in medium, serum, tissue, or follicular fluid is insufficient unless the chunk explicitly names the tagged cell as its secreting/releasing source.
-- Production is limited to C -> H. A cell producing a gene/protein product is represented only as C secreted G when secretion/release is explicit; there is no C production G relation in this task.
-- Binding is limited to H -> G and requires direct binding, receptor engagement, ligand-receptor association, or direct physical interaction. Shared pathway membership, response to treatment, or statistical association is not binding.
-- Biosynthesis, when enabled, is limited to G -> H. Mere co-expression of a gene and hormone, or a hormone changing that gene, is not hormone biosynthesis.
-
-Additional direction examples:
-- "[G1]KITLG[/G1] activated [C1]oocytes[/C1]" gives G1 activation C1.
-- "[C1]Oocytes[/C1] were activated by [G1]KITLG[/G1]" also gives G1 activation C1.
-- "[H1]FSH[/H1] stimulated [C1]granulosa cells[/C1]" gives H1 activation C1 unless the text specifically states proliferation.
-- "[H1]FSH[/H1] increased the number of [C1]granulosa cells[/C1]" gives H1 proliferation C1.
-- "[G1]AMH[/G1] suppressed activation of [C1]primordial follicles[/C1]" gives G1 inhibition C1 when C1 is the tagged affected cell population.
-- "[H1]Progesterone[/H1] inhibited [G1]ESR1[/G1] activity" gives H1 inhibition G1, whereas "reduced [G1]ESR1[/G1] expression" gives H1 downregulation G1.
-- "[C1]Granulosa cells[/C1] released [G1]VEGFA[/G1]" gives C1 secreted G1. A sentence saying only that VEGFA was present gives no secretion relation.
-- "Neither [H1]estradiol[/H1] nor vehicle altered [G1]FSHR[/G1]" gives no relation because the effect is negated.
-- "We tested whether [H1]estradiol[/H1] increases [G1]FSHR[/G1]" gives no relation unless the chunk also asserts the result.
-- "[H1]Estradiol[/H1] increased [G1]FSHR[/G1] in [C1]granulosa cells[/C1] but not in [C2]theca cells[/C2]" gives cell_context [C1], not C2.
-- "In [C1]granulosa cells[/C1] and [C2]cumulus cells[/C2], [H1]FSH[/H1] increased [G1]CYP19A1[/G1] expression" gives one H1 upregulation G1 triple with cell_context [C1,C2].
-
-Cell context is especially important for hormone-gene relations in ovarian studies:
-- For H -> G relations, and for G -> H biosynthesis when enabled, put in cell_context every tagged C entity that the chunk explicitly identifies as the cell in which the relation occurs.
-- A context is valid only when the wording connects that cell to the hormone-gene relation; nearby co-occurrence is insufficient.
-- Do not infer a cell type from general ovarian knowledge.
-- If the hormone-gene relation is explicit but no tagged cell context is explicitly linked, return an empty cell_context array.
-- For every relation that is not hormone-gene, return an empty cell_context array.
-
-Direction and predicate examples. Treat these as rules, not as biological knowledge:
-- "[H1]Estradiol[/H1] increased [G1]FSHR[/G1] expression in [C1]granulosa cells[/C1]" gives H1 upregulation G1 with cell_context [C1]. Expression wording selects upregulation, not activation.
-- "[H1]Estradiol[/H1] activated [G1]ESR1[/G1] signaling in [C1]granulosa cells[/C1]" gives H1 activation G1 with cell_context [C1]. Functional activation wording selects activation, not upregulation.
-- "[G1]BMP15[/G1] stimulated proliferation of [C1]granulosa cells[/C1]" gives G1 proliferation C1. The proliferating cell is always the object.
-- "Proliferation of [C1]granulosa cells[/C1] was inhibited by [H1]progesterone[/H1]" gives H1 inhibition C1. Passive voice does not reverse the biological direction.
-- "[C1]Granulosa cells[/C1] secreted [H1]inhibin A[/H1]" gives C1 secreted H1. "[C1]Granulosa cells[/C1] synthesized [H1]estradiol[/H1]" gives C1 production H1.
-- "[H1]Estradiol[/H1] bound [G1]ESR1[/G1] in [C1]granulosa cells[/C1]" gives H1 binding G1 with cell_context [C1].
-- "[G1]CYP19A1[/G1] was required for [H1]estradiol[/H1] biosynthesis in [C1]granulosa cells[/C1]" gives G1 biosynthesis H1 with cell_context [C1], but only when biosynthesis is present in the allowed schema.
-- A sentence that merely measures [G1]FSHR[/G1], reports [H1]estradiol[/H1] concentration, or lists both entities without an explicit causal or physical relation gives no triple.
-- A tagged cell mentioned elsewhere in the chunk is not cell context unless the wording explicitly locates the hormone-gene relation in that cell.
+Examples:
+- "[G1]KITLG[/G1] activated [C1]oocytes[/C1]" -> G1 activation C1.
+- "[C1]Oocytes[/C1] were activated by [G1]KITLG[/G1]" -> G1 activation C1.
+- "[H1]FSH[/H1] increased the number of [C1]granulosa cells[/C1]" -> H1 proliferation C1.
+- "[H1]Estradiol[/H1] increased [G1]FSHR[/G1] expression in [C1]granulosa cells[/C1]" -> H1 upregulation G1 with cell_context [C1].
+- "[H1]Estradiol[/H1] activated [G1]ESR1[/G1] signaling" -> H1 activation G1.
+- "[C1]Granulosa cells[/C1] released [G1]VEGFA[/G1]" -> C1 secreted G1.
+- "[C1]Granulosa cells[/C1] synthesized [H1]estradiol[/H1]" -> C1 secreted H1.
+- "[H1]Estradiol[/H1] bound [G1]ESR1[/G1] in [C1]granulosa cells[/C1]" -> H1 binding G1 with cell_context [C1].
+- "Neither [H1]estradiol[/H1] nor vehicle altered [G1]FSHR[/G1]" -> no relation.
+- "We tested whether [H1]estradiol[/H1] increases [G1]FSHR[/G1]" -> no relation unless the result is also asserted.
 
 If no valid relation is explicit, return {"triples":[]}.
 """.strip()
 
 
-def allowed_predicates(*, enable_biosynthesis: bool) -> tuple[str, ...]:
-    if enable_biosynthesis:
-        return (*BASE_PREDICATES, OPTIONAL_PREDICATE)
+def allowed_predicates() -> tuple[str, ...]:
     return BASE_PREDICATES
 
 
-def response_schema(*, enable_biosynthesis: bool) -> dict[str, Any]:
+def response_schema() -> dict[str, Any]:
     """Return one invariant schema for every request in a deployment."""
 
     return {
@@ -150,11 +113,7 @@ def response_schema(*, enable_biosynthesis: bool) -> dict[str, Any]:
                         "subject": {"type": "string"},
                         "predicate": {
                             "type": "string",
-                            "enum": list(
-                                allowed_predicates(
-                                    enable_biosynthesis=enable_biosynthesis
-                                )
-                            ),
+                            "enum": list(allowed_predicates()),
                         },
                         "object": {"type": "string"},
                         "cell_context": {
@@ -181,8 +140,6 @@ def relation_allowed(
     subject: str,
     predicate: str,
     object_: str,
-    *,
-    enable_biosynthesis: bool,
 ) -> bool:
     """Enforce the exact entity-direction matrix requested by the project."""
 
@@ -199,13 +156,10 @@ def relation_allowed(
         "inhibition": {("gene", "cell"), ("hormone", "cell"), ("hormone", "gene")},
         "proliferation": {("gene", "cell"), ("hormone", "cell")},
         "secreted": {("cell", "gene"), ("cell", "hormone")},
-        "production": {("cell", "hormone")},
         "binding": {("hormone", "gene")},
         "upregulation": {("hormone", "gene")},
         "downregulation": {("hormone", "gene")},
     }
-    if enable_biosynthesis:
-        matrix["biosynthesis"] = {("gene", "hormone")}
     return pair in matrix.get(predicate, set())
 
 
@@ -213,23 +167,14 @@ def is_hormone_gene_relation(subject: str, object_: str) -> bool:
     return {subject[:1], object_[:1]} == {"G", "H"}
 
 
-def has_possible_allowed_pair(
-    entity_ids: Iterable[str], *, enable_biosynthesis: bool
-) -> bool:
+def has_possible_allowed_pair(entity_ids: Iterable[str]) -> bool:
     ids = list(entity_ids)
     for subject in ids:
         for object_ in ids:
             if subject == object_:
                 continue
-            for predicate in allowed_predicates(
-                enable_biosynthesis=enable_biosynthesis
-            ):
-                if relation_allowed(
-                    subject,
-                    predicate,
-                    object_,
-                    enable_biosynthesis=enable_biosynthesis,
-                ):
+            for predicate in allowed_predicates():
+                if relation_allowed(subject, predicate, object_):
                     return True
     return False
 
@@ -423,7 +368,6 @@ def prepare_chunk(
     row_index: int,
     source_row: Mapping[str, Any],
     annotation_row: Mapping[str, Any],
-    enable_biosynthesis: bool,
 ) -> PreparedChunk:
     """Join one Stage 1 text row to its aligned Stage 2 annotation row."""
 
@@ -492,10 +436,7 @@ def prepare_chunk(
         span.tag = tag
 
     tagged = _render_tags(text, selected) if selected else text
-    eligible = len(entities) >= 2 and has_possible_allowed_pair(
-        entities,
-        enable_biosynthesis=enable_biosynthesis,
-    )
+    eligible = len(entities) >= 2 and has_possible_allowed_pair(entities)
     return PreparedChunk(
         custom_id=custom_id,
         identity=identity,
@@ -562,7 +503,6 @@ def request_body(
     max_output_tokens: int,
     reasoning_effort: str,
     cache_key: str,
-    enable_biosynthesis: bool,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": model,
@@ -576,9 +516,7 @@ def request_body(
                 "type": "json_schema",
                 "name": "ovarian_relation_extraction",
                 "strict": True,
-                "schema": response_schema(
-                    enable_biosynthesis=enable_biosynthesis
-                ),
+                "schema": response_schema(),
             }
         },
     }
@@ -615,7 +553,6 @@ def sanitize_triples(
     parsed: Any,
     *,
     entities: Mapping[str, Mapping[str, Any]],
-    enable_biosynthesis: bool,
     require_hormone_gene_cell_context: bool,
     max_triples: int = 50,
 ) -> list[dict[str, Any]]:
@@ -636,12 +573,7 @@ def sanitize_triples(
         object_ = str(raw.get("object") or "").strip()
         if subject not in allowed_ids or object_ not in allowed_ids:
             continue
-        if not relation_allowed(
-            subject,
-            predicate,
-            object_,
-            enable_biosynthesis=enable_biosynthesis,
-        ):
+        if not relation_allowed(subject, predicate, object_):
             continue
 
         context: list[str] = []

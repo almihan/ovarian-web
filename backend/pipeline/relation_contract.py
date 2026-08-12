@@ -29,7 +29,6 @@ def relation_model_signature() -> str:
         "model": settings.relation_model,
         "max_output_tokens": settings.relation_max_output_tokens,
         "reasoning_effort": settings.relation_reasoning_effort,
-        "enable_biosynthesis": settings.relation_enable_biosynthesis,
         "require_hormone_gene_cell_context": (
             settings.relation_require_hormone_gene_cell_context
         ),

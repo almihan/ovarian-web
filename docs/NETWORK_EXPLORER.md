@@ -136,9 +136,10 @@ runtime ontology download is required locally or on Railway.
 | Hierarchy-only Cell Ontology term | light-blue box |
 
 Cell Ontology `is_a` edges are dashed blue-gray arrows from child to parent.
-Directed biological edge width grows logarithmically with evidence count. Inhibition and
-downregulation are red; binding is blue; secretion is teal; production and
-biosynthesis are violet; other positive directed relations are green.
+Biological edge width grows logarithmically with evidence count. Binding is a
+blue undirected edge with no arrow. Inhibition and downregulation are red; the
+merged cell-to-hormone secretion/production relation is teal; other positive
+directed relations are green.
 
 ## API
 

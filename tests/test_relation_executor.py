@@ -65,7 +65,6 @@ def test_gateway_calls_online_responses_and_validates_locally(monkeypatch) -> No
         relation_max_output_tokens=1200,
         relation_reasoning_effort="none",
         relation_prompt_cache_key="ovarian-relations-v4",
-        relation_enable_biosynthesis=False,
         relation_require_hormone_gene_cell_context=False,
     )
     monkeypatch.setattr(executor_module, "settings", test_settings)
@@ -299,7 +298,6 @@ def test_executor_resumes_successful_online_response_without_duplicate_request(
         relation_progress_update_every=1,
         relation_prompt_cache_key="ovarian-relations-v4",
         relation_prompt_cache_shards=32,
-        relation_enable_biosynthesis=False,
         relation_require_hormone_gene_cell_context=False,
     )
     test_settings.ensure_directories()

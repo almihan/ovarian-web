@@ -95,6 +95,22 @@ function formatType(value) {
     return type === "gene" ? "Gene / protein" : type === "cell" ? "Cell / cell type" : type === "hormone" ? "Hormone" : "Entity";
 }
 
+function isUndirectedPredicate(predicate) {
+    return String(predicate || "").toLowerCase() === "binding";
+}
+
+function relationEndpointText(subject, predicate, object) {
+    const separator = isUndirectedPredicate(predicate) ? " — " : " → ";
+    return `${subject || ""}${separator}${object || ""}`;
+}
+
+function relationEvidenceText(subject, predicate, object) {
+    if (isUndirectedPredicate(predicate)) {
+        return `${subject || ""} — ${predicate || "binding"} — ${object || ""}`;
+    }
+    return `${subject || ""} — ${predicate || "relation"} → ${object || ""}`;
+}
+
 function cellOntologyId(value) {
     const match = String(value || "").match(/CL[:_](\d{7})/i);
     return match ? `CL:${match[1]}` : "";
@@ -161,6 +177,13 @@ function detailRows(rows) {
 function renderNodeDetail(node) {
     const aliases = Array.isArray(node.aliases) ? node.aliases : [];
     const predicates = Array.isArray(node.predicates) ? node.predicates : [];
+    const directionRows = [
+        ["Directed outgoing", formatNumber(node.outgoing_count)],
+        ["Directed incoming", formatNumber(node.incoming_count)],
+    ];
+    if (Number(node.undirected_count || 0) > 0) {
+        directionRows.push(["Undirected binding", formatNumber(node.undirected_count)]);
+    }
     $("#detailsHeading").textContent = node.label || node.id;
     $("#detailsSubheading").textContent = `${formatType(node.entity_type)} · normalized across the complete Stage 3 artifact`;
     $("#detailsContent").innerHTML = `
@@ -172,8 +195,7 @@ function renderNodeDetail(node) {
                 ["Papers", formatNumber(node.paper_count)],
                 ["Chunks", formatNumber(node.chunk_count)],
                 ["Relations", formatNumber(node.relation_count)],
-                ["Outgoing", formatNumber(node.outgoing_count)],
-                ["Incoming", formatNumber(node.incoming_count)],
+                ...directionRows,
                 ["Cell-context uses", formatNumber(node.context_count)],
             ])}
         </div>
@@ -183,22 +205,34 @@ function renderNodeDetail(node) {
         </div>
         <div class="detail-card">
             <h3>Relation predicates</h3>
-            ${predicates.length ? `<ul class="detail-list">${predicates.map((item) => `<li><span>${escapeHtml(item.predicate)}</span><strong>${formatNumber(item.evidence_count)} evidence · ${formatNumber(item.outgoing)} out · ${formatNumber(item.incoming)} in</strong></li>`).join("")}</ul>` : '<p class="empty-copy">No incident relations.</p>'}
+            ${predicates.length ? `<ul class="detail-list">${predicates.map((item) => {
+                const direction = isUndirectedPredicate(item.predicate)
+                    ? `${formatNumber(item.undirected)} undirected`
+                    : `${formatNumber(item.outgoing)} out · ${formatNumber(item.incoming)} in`;
+                return `<li><span>${escapeHtml(item.predicate)}</span><strong>${formatNumber(item.evidence_count)} evidence · ${direction}</strong></li>`;
+            }).join("")}</ul>` : '<p class="empty-copy">No incident relations.</p>'}
         </div>`;
 }
 
 function renderEdgeDetail(edge) {
     const contexts = Array.isArray(edge.cell_contexts) ? edge.cell_contexts : [];
+    const undirected = edge.directed === false || isUndirectedPredicate(edge.predicate);
+    const firstEndpointLabel = undirected ? "Endpoint 1" : "Subject";
+    const secondEndpointLabel = undirected ? "Endpoint 2" : "Object";
     $("#detailsHeading").textContent = edge.predicate || "Relation";
-    $("#detailsSubheading").textContent = `${edge.subject_label || edge.subject_id} → ${edge.object_label || edge.object_id}`;
+    $("#detailsSubheading").textContent = relationEndpointText(
+        edge.subject_label || edge.subject_id,
+        edge.predicate,
+        edge.object_label || edge.object_id,
+    );
     $("#detailsContent").innerHTML = `
         <div class="detail-card">
-            ${typePill("edge", "Directed relation")}
+            ${typePill("edge", undirected ? "Undirected relation" : "Directed relation")}
             ${detailRows([
                 ["Edge ID", edge.id],
-                ["Subject", `${edge.subject_label || edge.subject_id} (${formatType(edge.subject_type)})`],
+                [firstEndpointLabel, `${edge.subject_label || edge.subject_id} (${formatType(edge.subject_type)})`],
                 ["Predicate", edge.predicate],
-                ["Object", `${edge.object_label || edge.object_id} (${formatType(edge.object_type)})`],
+                [secondEndpointLabel, `${edge.object_label || edge.object_id} (${formatType(edge.object_type)})`],
                 ["Papers", formatNumber(edge.paper_count)],
                 ["Chunks / evidence", formatNumber(edge.evidence_count)],
                 ["Evidence with cell context", formatNumber(edge.context_evidence_count)],
@@ -415,7 +449,11 @@ function evidenceCard(item) {
     const paper = paperDisplayLabel(item, destinations);
     const metadata = [item.journal, item.pub_year, item.section_type].filter(Boolean).join(" · ");
     const relation = item.predicate
-        ? `${item.subject_label || item.subject_id} — ${item.predicate} → ${item.object_label || item.object_id}`
+        ? relationEvidenceText(
+            item.subject_label || item.subject_id,
+            item.predicate,
+            item.object_label || item.object_id,
+        )
         : "";
     const contexts = Array.isArray(item.cell_contexts) ? item.cell_contexts : [];
     const destinationLinks = destinations.map((destination) =>

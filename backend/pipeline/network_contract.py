@@ -6,8 +6,8 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-NETWORK_PIPELINE_VERSION = "network-v3"
-NETWORK_GRAPH_SCHEMA = "ovarian-interaction-network-sqlite-v3"
+NETWORK_PIPELINE_VERSION = "network-v1"
+NETWORK_GRAPH_SCHEMA = "ovarian-interaction-network-sqlite-v1"
 ENTITY_INDEX_SCHEMA = "ovarian-entity-relation-index-v1"
 PYVIS_VERSION = "0.3.2"
 VIS_NETWORK_VERSION = "9.1.2"
@@ -31,6 +31,7 @@ def network_signature() -> str:
         "global_identity": "normalized-id-or-normalized-label-sha256",
         "evidence": "aligned-stage1-chunk-plus-stage2-entity-spans",
         "indexes": "predicate-support-v1",
+        "binding_semantics": "undirected-canonical-hormone-gene",
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

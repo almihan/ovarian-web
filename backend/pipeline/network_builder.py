@@ -313,8 +313,14 @@ def _finalize_graph(connection: sqlite3.Connection) -> None:
             ), LOWER(normalized_id)),
             paper_count = (SELECT COUNT(*) FROM node_papers p WHERE p.node_id = nodes.id),
             chunk_count = (SELECT COUNT(*) FROM node_chunks c WHERE c.node_id = nodes.id),
-            outgoing_count = (SELECT COUNT(*) FROM edges e WHERE e.subject_id = nodes.id),
-            incoming_count = (SELECT COUNT(*) FROM edges e WHERE e.object_id = nodes.id),
+            outgoing_count = (
+                SELECT COUNT(*) FROM edges e
+                WHERE e.subject_id = nodes.id AND e.predicate <> 'binding'
+            ),
+            incoming_count = (
+                SELECT COUNT(*) FROM edges e
+                WHERE e.object_id = nodes.id AND e.predicate <> 'binding'
+            ),
             relation_count =
                 (SELECT COUNT(*) FROM edges e WHERE e.subject_id = nodes.id)
                 + (SELECT COUNT(*) FROM edges e WHERE e.object_id = nodes.id),
@@ -403,18 +409,23 @@ def _write_entity_index(connection: sqlite3.Connection, destination: Path) -> in
                             (edge["id"],),
                         )
                     ]
+                    predicate = str(edge["predicate"])
                     relations.append(
                         {
                             "id": edge["id"],
                             "subject": edge["subject_id"],
                             "subject_label": edge["subject_label"],
-                            "predicate": edge["predicate"],
+                            "predicate": predicate,
                             "object": edge["object_id"],
                             "object_label": edge["object_label"],
                             "direction": (
-                                "outgoing"
-                                if edge["subject_id"] == node["id"]
-                                else "incoming"
+                                "undirected"
+                                if predicate == "binding"
+                                else (
+                                    "outgoing"
+                                    if edge["subject_id"] == node["id"]
+                                    else "incoming"
+                                )
                             ),
                             "stats": {
                                 "paper_count": edge["paper_count"],
@@ -427,6 +438,9 @@ def _write_entity_index(connection: sqlite3.Connection, destination: Path) -> in
                             "evidence": evidence,
                         }
                     )
+                undirected_count = sum(
+                    relation["direction"] == "undirected" for relation in relations
+                )
                 row = {
                     "schema": ENTITY_INDEX_SCHEMA,
                     "id": node["id"],
@@ -440,6 +454,7 @@ def _write_entity_index(connection: sqlite3.Connection, destination: Path) -> in
                         "relation_count": node["relation_count"],
                         "incoming_count": node["incoming_count"],
                         "outgoing_count": node["outgoing_count"],
+                        "undirected_count": undirected_count,
                         "cell_context_count": node["context_count"],
                     },
                     "relations": relations,
@@ -562,7 +577,6 @@ def build_interaction_network(
                         subject_tag,
                         predicate,
                         object_tag,
-                        enable_biosynthesis=True,
                     )
                 ):
                     stats["invalid_relation_count"] += 1
@@ -713,19 +727,24 @@ def build_interaction_network(
                 "SELECT predicate, COUNT(*) AS count FROM edges GROUP BY predicate"
             )
         }
-        stats["direction_counts"] = {
-            f"{row['subject_type']}->{row['object_type']}": int(row["count"])
-            for row in connection.execute(
-                """
-                SELECT s.entity_type AS subject_type, o.entity_type AS object_type,
-                       COUNT(*) AS count
-                FROM edges e
-                JOIN nodes s ON s.id = e.subject_id
-                JOIN nodes o ON o.id = e.object_id
-                GROUP BY s.entity_type, o.entity_type
-                """
+        direction_counts: dict[str, int] = {}
+        for row in connection.execute(
+            """
+            SELECT e.predicate, s.entity_type AS subject_type,
+                   o.entity_type AS object_type, COUNT(*) AS count
+            FROM edges e
+            JOIN nodes s ON s.id = e.subject_id
+            JOIN nodes o ON o.id = e.object_id
+            GROUP BY e.predicate, s.entity_type, o.entity_type
+            """
+        ):
+            key = (
+                "hormone--gene"
+                if row["predicate"] == "binding"
+                else f"{row['subject_type']}->{row['object_type']}"
             )
-        }
+            direction_counts[key] = direction_counts.get(key, 0) + int(row["count"])
+        stats["direction_counts"] = direction_counts
         for key, value in {
             "schema": NETWORK_GRAPH_SCHEMA,
             "pipeline_version": NETWORK_PIPELINE_VERSION,

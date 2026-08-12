@@ -131,7 +131,6 @@ class Settings:
     relation_reasoning_effort: str
     relation_prompt_cache_key: str
     relation_prompt_cache_shards: int
-    relation_enable_biosynthesis: bool
     relation_require_hormone_gene_cell_context: bool
 
     network_initial_nodes: int
@@ -452,18 +451,14 @@ def get_settings() -> Settings:
             choices={"none", "low", "medium", "high", "xhigh"},
         ),
         relation_prompt_cache_key=(
-            os.getenv("RELATION_PROMPT_CACHE_KEY", "ovarian-relations-v4").strip()
-            or "ovarian-relations-v4"
+            os.getenv("RELATION_PROMPT_CACHE_KEY", "ovarian-relations-v1").strip()
+            or "ovarian-relations-v1"
         )[:64],
         relation_prompt_cache_shards=_as_int(
             os.getenv("RELATION_PROMPT_CACHE_SHARDS"),
             default=32,
             minimum=1,
             maximum=128,
-        ),
-        relation_enable_biosynthesis=_as_bool(
-            os.getenv("RELATION_ENABLE_BIOSYNTHESIS"),
-            default=False,
         ),
         relation_require_hormone_gene_cell_context=_as_bool(
             os.getenv("RELATION_REQUIRE_HORMONE_GENE_CELL_CONTEXT"),

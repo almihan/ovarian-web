@@ -50,8 +50,6 @@ _NODE_COLORS = {
 _NEGATIVE = {"inhibition", "downregulation"}
 _EDGE_COLORS = {
     "binding": "#4F72B8",
-    "production": "#7A63B8",
-    "biosynthesis": "#7A63B8",
     "secreted": "#2D8C87",
 }
 _ONE_MIB = 1024 * 1024
@@ -130,9 +128,12 @@ def _node_title(node: Mapping[str, Any]) -> str:
 
 
 def _edge_title(edge: Mapping[str, Any]) -> str:
+    predicate = str(edge.get("predicate") or "relation")
+    separator = " — " if predicate == "binding" else " → "
     return (
-        f"<strong>{html.escape(str(edge.get('predicate') or 'relation'))}</strong><br>"
-        f"{html.escape(str(edge.get('subject_label') or edge.get('subject_id') or ''))} → "
+        f"<strong>{html.escape(predicate)}</strong><br>"
+        f"{html.escape(str(edge.get('subject_label') or edge.get('subject_id') or ''))}"
+        f"{separator}"
         f"{html.escape(str(edge.get('object_label') or edge.get('object_id') or ''))}<br>"
         f"Papers: {int(edge.get('paper_count') or 0):,}<br>"
         f"Evidence chunks: {int(edge.get('evidence_count') or 0):,}<br>"
@@ -181,6 +182,7 @@ def _edge_payload(edge: Mapping[str, Any]) -> dict[str, Any]:
     evidence_count = int(edge.get("evidence_count") or 0)
     paper_count = int(edge.get("paper_count") or 0)
     predicate = str(edge.get("predicate") or "relation")
+    directed = predicate != "binding"
     color = _edge_color(predicate)
     return {
         "id": str(edge["id"]),
@@ -189,13 +191,14 @@ def _edge_payload(edge: Mapping[str, Any]) -> dict[str, Any]:
         # Show the biological predicate directly on the interaction edge.
         "label": predicate,
         "predicate": predicate,
+        "directed": directed,
         "edge_kind": "interaction",
         "title": _edge_title(edge),
         "paper_count": paper_count,
         "chunk_count": int(edge.get("chunk_count") or 0),
         "evidence_count": evidence_count,
         "context_evidence_count": int(edge.get("context_evidence_count") or 0),
-        "arrows": {"to": {"enabled": True, "scaleFactor": 0.75}},
+        "arrows": {"to": {"enabled": directed, "scaleFactor": 0.75}},
         "color": {"color": color, "highlight": color, "hover": color, "opacity": 0.86},
         "width": round(1.5 + min(7, 1.6 * math.log1p(paper_count)), 2),
         "smooth": {"enabled": True, "type": "dynamic", "roundness": 0.22},
@@ -940,7 +943,16 @@ class NetworkRepository:
     def node_detail(self, job_id: str, node_id: str) -> dict[str, Any]:
         with self.connection(job_id) as connection:
             node = connection.execute(
-                "SELECT * FROM nodes WHERE id = ?", (node_id,)
+                """
+                SELECT n.*,
+                       (
+                           SELECT COUNT(*) FROM edges e
+                           WHERE e.predicate = 'binding'
+                             AND (e.subject_id = n.id OR e.object_id = n.id)
+                       ) AS undirected_count
+                FROM nodes n WHERE n.id = ?
+                """,
+                (node_id,),
             ).fetchone()
             if node is None:
                 raise KeyError(node_id)
@@ -959,8 +971,17 @@ class NetworkRepository:
                 for row in connection.execute(
                     """
                     SELECT predicate,
-                           SUM(CASE WHEN subject_id = ? THEN 1 ELSE 0 END) AS outgoing,
-                           SUM(CASE WHEN object_id = ? THEN 1 ELSE 0 END) AS incoming,
+                           SUM(
+                               CASE WHEN predicate <> 'binding' AND subject_id = ?
+                                    THEN 1 ELSE 0 END
+                           ) AS outgoing,
+                           SUM(
+                               CASE WHEN predicate <> 'binding' AND object_id = ?
+                                    THEN 1 ELSE 0 END
+                           ) AS incoming,
+                           SUM(
+                               CASE WHEN predicate = 'binding' THEN 1 ELSE 0 END
+                           ) AS undirected,
                            SUM(evidence_count) AS evidence_count
                     FROM edges WHERE subject_id = ? OR object_id = ?
                     GROUP BY predicate ORDER BY evidence_count DESC, predicate
@@ -998,7 +1019,9 @@ class NetworkRepository:
                     (edge_id,),
                 ).fetchall()
             ]
-        return {**_row_dict(edge), "cell_contexts": contexts}
+        payload = {**_row_dict(edge), "cell_contexts": contexts}
+        payload["directed"] = str(payload.get("predicate") or "") != "binding"
+        return payload
 
     def edge_evidence(self, job_id: str, edge_id: str, *, limit: int) -> dict[str, Any]:
         safe_limit = max(1, min(settings.network_evidence_limit, int(limit)))

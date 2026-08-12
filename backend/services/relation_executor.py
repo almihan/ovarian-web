@@ -373,7 +373,6 @@ class OpenAIResponsesGateway:
                 custom_id=item.custom_id,
                 shard_count=cache_shards,
             ),
-            enable_biosynthesis=settings.relation_enable_biosynthesis,
         )
         response = await self.client.responses.create(**body)
         payload = _model_dict(response)
@@ -408,7 +407,6 @@ class OpenAIResponsesGateway:
             triples = sanitize_triples(
                 parsed,
                 entities=item.entities,
-                enable_biosynthesis=settings.relation_enable_biosynthesis,
                 require_hormone_gene_cell_context=(
                     settings.relation_require_hormone_gene_cell_context
                 ),
@@ -966,7 +964,6 @@ class RelationExecutor:
             "request_timeout_seconds": settings.relation_request_timeout_seconds,
             "max_request_retries": settings.relation_max_request_retries,
             "prompt_cache_shards": settings.relation_prompt_cache_shards,
-            "biosynthesis_enabled": settings.relation_enable_biosynthesis,
             "cell_context_required": (
                 settings.relation_require_hormone_gene_cell_context
             ),
@@ -1162,9 +1159,6 @@ class RelationExecutor:
                                     row_index=row_index,
                                     source_row=source_row,
                                     annotation_row=annotation_row,
-                                    enable_biosynthesis=(
-                                        settings.relation_enable_biosynthesis
-                                    ),
                                 )
                             )
                             row_index += 1
@@ -1473,9 +1467,6 @@ class RelationExecutor:
                         ),
                         "reasoning_effort": settings.relation_reasoning_effort,
                         "max_output_tokens": settings.relation_max_output_tokens,
-                        "biosynthesis_enabled": (
-                            settings.relation_enable_biosynthesis
-                        ),
                         "hormone_gene_cell_context_required": (
                             settings.relation_require_hormone_gene_cell_context
                         ),

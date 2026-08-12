@@ -177,9 +177,9 @@
                             <div class="stage-panel-main">
                                 <div class="stage-panel-heading">
                                     <span class="stage-panel-icon relation"><svg class="icon"><use href="#icon-link"></use></svg></span>
-                                    <div><span>Stage 3 of 4</span><h3>Extract directed biological relations</h3><p>Find evidence-supported activation, inhibition, proliferation, secretion, production, binding, upregulation, and downregulation relations.</p></div>
+                                    <div><span>Stage 3 of 4</span><h3>Extract biological relations</h3><p>Find evidence-supported activation, inhibition, proliferation, merged secretion/production, binding, upregulation, and downregulation relations.</p></div>
                                 </div>
-                                <div class="stage-tags" aria-label="Relation extraction outputs"><span>Directed relations</span><span>Cell context</span><span>Evidence text</span></div>
+                                <div class="stage-tags" aria-label="Relation extraction outputs"><span>Validated triples</span><span>Cell context</span><span>Evidence text</span></div>
                                 <form id="relationForm" class="stage-action-form" novalidate>
                                     <div class="stage-action-row">
                                         <div class="stage-readiness" id="relationReadiness" data-state="locked"><i></i><div><strong id="relationReadinessTitle">Waiting for Stage 2</strong><span id="relationReadinessText">Complete entity extraction to unlock relation extraction.</span></div></div>
@@ -208,7 +208,7 @@
                             <div class="stage-panel-main">
                                 <div class="stage-panel-heading">
                                     <span class="stage-panel-icon network"><svg class="icon"><use href="#icon-network"></use></svg></span>
-                                    <div><span>Stage 4 of 4</span><h3>Build and explore the interaction network</h3><p>Convert normalized entities and validated relations into a searchable evidence-linked network for interactive exploration.</p></div>
+                                    <div><span>Stage 4 of 4</span><h3>Build and explore the interaction network</h3><p>Convert normalized entities and validated relations into a searchable evidence-linked network, with binding displayed without direction.</p></div>
                                 </div>
                                 <div class="stage-tags" aria-label="Network outputs"><span>Searchable graph</span><span>Evidence explorer</span><span>Downloadable index</span></div>
                                 <form id="networkForm" class="stage-action-form" novalidate>
