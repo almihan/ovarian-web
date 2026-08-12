@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Interactive ovarian cell, gene/protein, and hormone relation network.">
+    <title>Interaction Network · {{ app_name }}</title>
+    <link rel="icon" type="image/svg+xml" href="/static/images/favicon.svg">
+    <link rel="stylesheet" href="/vendor/vis-network.css?v=9.1.2">
+    <link rel="stylesheet" href="/static/css/network.css?v=20260811-paper-links-relation-types-1">
+</head>
+<body
+    data-network-job-id="{{ network_job_id }}"
+    data-initial-nodes="{{ initial_nodes }}"
+    data-max-initial-nodes="{{ max_initial_nodes }}"
+    data-relation-support-min="1"
+    data-expansion-limit="{{ expansion_limit }}"
+    data-hierarchy-max-paths="{{ hierarchy_max_paths }}"
+>
+    <header class="network-header">
+        <a class="network-brand" href="/" aria-label="Return to Ovarian Network pipeline">
+            <img src="/static/images/logo-mark.svg" alt="" width="36" height="36">
+            <span><strong>Ovarian Network</strong><small>Interaction explorer</small></span>
+        </a>
+        <div class="header-stats" aria-live="polite">
+            <span><strong id="headerNodeCount">—</strong> nodes</span>
+            <span><strong id="headerEdgeCount">—</strong> edges</span>
+            <span><strong id="headerPaperCount">—</strong> papers</span>
+        </div>
+        <div class="header-actions">
+            <button class="ghost-button" id="fitNetwork" type="button">Fit view</button>
+            <button class="ghost-button" id="togglePhysics" type="button" aria-pressed="true">Pause physics</button>
+            <a class="primary-link" href="/">Pipeline</a>
+        </div>
+    </header>
+
+    <main class="network-workspace">
+        <aside class="network-sidebar" aria-label="Network controls and evidence">
+            <div class="tab-list" role="tablist" aria-label="Network panels">
+                <button class="tab-button active" id="tabExplore" type="button" role="tab" aria-selected="true" aria-controls="panelExplore" data-tab="explore">Explore</button>
+                <button class="tab-button" id="tabDetails" type="button" role="tab" aria-selected="false" aria-controls="panelDetails" data-tab="details">Details</button>
+                <button class="tab-button" id="tabEvidence" type="button" role="tab" aria-selected="false" aria-controls="panelEvidence" data-tab="evidence">Evidence</button>
+                <button class="tab-button" id="tabHierarchy" type="button" role="tab" aria-selected="false" aria-controls="panelHierarchy" data-tab="hierarchy">Hierarchy</button>
+            </div>
+
+            <section class="tab-panel active" id="panelExplore" role="tabpanel" aria-labelledby="tabExplore">
+                <div class="panel-heading">
+                    <span>Initial view</span>
+                    <h1>Explore the interaction network</h1>
+                    <p>All cell, gene/protein, and hormone nodes are always eligible. The initial node limit affects only a reset, not later additions.</p>
+                </div>
+
+                <div class="network-filter-grid">
+                    <label>
+                        <span class="field-label">Top nodes</span>
+                        <input id="topNodeCount" type="number" min="1" max="{{ max_initial_nodes }}" step="1" value="{{ initial_nodes }}" inputmode="numeric">
+                    </label>
+                    <label>
+                        <span class="field-label">Relation support ≥</span>
+                        <input id="relationSupportMin" type="number" min="0" step="1" value="1" inputmode="numeric">
+                    </label>
+                </div>
+                <button class="secondary-button full-width filter-apply-button" id="resetNetwork" type="button">Apply to initial view</button>
+                <button class="hierarchy-button full-width hierarchy-open-button" id="showCellHierarchy" type="button">Show Cell Ontology hierarchy</button>
+                <p class="control-help">Nodes are ranked by the number of distinct supporting papers. A relation is shown only when its paper support is greater than or equal to the entered threshold. There is no top-relations selection.</p>
+
+                <div class="panel-divider"></div>
+
+                <div class="relation-filter-header">
+                    <div>
+                        <span class="field-label">Relation types</span>
+                        <small>Choose one or more predicates.</small>
+                    </div>
+                    <div class="relation-filter-actions">
+                        <button class="text-button" id="selectAllRelationTypes" type="button">Select all</button>
+                        <button class="text-button" id="clearRelationTypes" type="button">Clear</button>
+                    </div>
+                </div>
+                <div class="relation-type-options" id="relationTypeOptions" aria-live="polite">
+                    <p class="empty-copy">Loading relation types…</p>
+                </div>
+                <button class="primary-button full-width" id="applyRelationTypes" type="button" disabled>Show selected relations</button>
+                <p class="control-help" id="relationTypeHelp">This view loads every edge with a selected predicate and every endpoint node across the complete network. The Top nodes value does not limit it.</p>
+
+                <div class="panel-divider"></div>
+
+                <label class="field-label" for="nodeSearch">Select node</label>
+                <div class="search-control">
+                    <input id="nodeSearch" type="search" maxlength="160" placeholder="Search label, synonym, CL, Gene ID, or hormone ID" autocomplete="off">
+                    <span id="searchSpinner" hidden aria-label="Searching"></span>
+                </div>
+                <div class="search-results" id="nodeSearchResults" aria-live="polite">
+                    <p class="empty-copy">Type at least one character to search the complete network.</p>
+                </div>
+                <div class="selected-node-card" id="selectedSearchNode" hidden>
+                    <span id="selectedSearchType">Entity</span>
+                    <strong id="selectedSearchLabel">—</strong>
+                    <small id="selectedSearchId">—</small>
+                    <button class="primary-button" id="addSelectedNode" type="button">Add node + neighbours</button>
+                </div>
+                <p class="control-help">Adding a node updates the current graph. Existing nodes and positions are preserved.</p>
+
+                <div class="panel-divider"></div>
+
+                <div class="view-summary">
+                    <div><strong id="viewNodeCount">0</strong><span>Visible nodes</span></div>
+                    <div><strong id="viewEdgeCount">0</strong><span>Visible edges</span></div>
+                </div>
+
+                <div class="legend" aria-label="Network legend">
+                    <h2>Legend</h2>
+                    <div><i class="node-swatch cell"></i><span>Cell / cell type</span></div>
+                    <div><i class="node-swatch gene"></i><span>Gene / protein</span></div>
+                    <div><i class="node-swatch hormone"></i><span>Hormone</span></div>
+                    <div><i class="node-swatch hierarchy"></i><span>Cell Ontology hierarchy-only term</span></div>
+                    <div><i class="edge-swatch positive"></i><span>Positive / other directed relation</span></div>
+                    <div><i class="edge-swatch negative"></i><span>Inhibition / downregulation</span></div>
+                </div>
+
+                <div class="explorer-help">
+                    <strong>Controls</strong>
+                    <p>Drag nodes to rearrange them. Scroll to zoom. Click a node or edge for details. Double-click a node to remove it from only the current browser view.</p>
+                </div>
+            </section>
+
+            <section class="tab-panel" id="panelDetails" role="tabpanel" aria-labelledby="tabDetails" hidden>
+                <div class="panel-heading">
+                    <span>Selection</span>
+                    <h2 id="detailsHeading">No node or edge selected</h2>
+                    <p id="detailsSubheading">Click a network element to inspect its normalized identity and relation statistics.</p>
+                </div>
+                <div id="detailsContent" class="details-content">
+                    <p class="empty-copy">Selection details will appear here.</p>
+                </div>
+                <div class="selection-actions">
+                    <button class="secondary-button full-width" id="showSelectionEvidence" type="button" disabled>Open supporting evidence</button>
+                </div>
+            </section>
+
+            <section class="tab-panel" id="panelEvidence" role="tabpanel" aria-labelledby="tabEvidence" hidden>
+                <div class="panel-heading">
+                    <span>Source passages</span>
+                    <h2 id="evidenceHeading">No evidence selected</h2>
+                    <p id="evidenceSubheading">Select a node or edge, then open its supporting papers and passages.</p>
+                </div>
+                <label class="field-label" for="evidenceFilter">Filter loaded evidence</label>
+                <input id="evidenceFilter" type="search" placeholder="Paper ID, journal, cell context, or passage text" autocomplete="off">
+                <div id="evidenceList" class="evidence-list">
+                    <p class="empty-copy">Supporting passages will appear here.</p>
+                </div>
+            </section>
+
+            <section class="tab-panel" id="panelHierarchy" role="tabpanel" aria-labelledby="tabHierarchy" hidden>
+                <div class="panel-heading">
+                    <span>Cell Ontology</span>
+                    <h2 id="hierarchyHeading">Visible cell hierarchy</h2>
+                    <p id="hierarchySubheading">Show the merged root-to-term <code>is_a</code> paths for all cells currently visible in the graph.</p>
+                </div>
+                <div id="hierarchyContent" class="hierarchy-content">
+                    <p class="empty-copy">Cell Ontology paths will appear here.</p>
+                </div>
+                <p class="control-help hierarchy-help">Click an ancestor or direct subclass to add that term and its available interaction neighbourhood to the existing graph. Existing nodes are preserved.</p>
+            </section>
+        </aside>
+
+        <section class="network-stage" aria-label="Interactive interaction network">
+            <div class="network-status-bar">
+                <span id="networkStatusText">Preparing network explorer…</span>
+                <span id="stabilizationStatus"></span>
+            </div>
+            <div id="networkCanvas" role="application" aria-label="Directed ovarian interaction network"></div>
+
+            <div class="build-overlay" id="buildOverlay" aria-live="polite">
+                <div class="build-card">
+                    <img src="/static/images/logo-mark.svg" alt="" width="52" height="52">
+                    <span id="buildStage">Stage 4</span>
+                    <h2 id="buildMessage">Preparing the interaction network</h2>
+                    <div class="build-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="buildProgressTrack"><i id="buildProgressBar"></i></div>
+                    <strong id="buildPercent">0%</strong>
+                    <p>The page will open the graph automatically when the SQLite index is ready.</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div class="network-toast" id="networkToast" role="status" hidden></div>
+    <script src="/vendor/vis-network.min.js?v=9.1.2" defer></script>
+    <script src="/static/js/network.js?v=20260811-paper-links-relation-types-1" defer></script>
+</body>
+</html>

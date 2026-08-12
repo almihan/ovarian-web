@@ -8,21 +8,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt ./
-
-# Railway uses CPU compute for this service. Install the CPU-only PyTorch wheel
-# so the image does not include unnecessary CUDA libraries.
-ARG PYTORCH_CPU_INDEX=https://download.pytorch.org/whl/cpu
 RUN python -m pip install --upgrade pip \
-    && pip install --no-cache-dir torch==2.7.0 --index-url "${PYTORCH_CPU_INDEX}" \
-    && pip install --no-cache-dir -r requirements.txt
+    && python -m pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Railway runs the UI/controller, retrieval, PubTator3 HTTP branch, and final
+# streaming merge. PyTorch, Transformers, CUDA libraries, and CellExLink model
+# checkpoints remain in Modal.
+COPY backend ./backend
 
-RUN mkdir -p /data/papers /data/results /data/model_cache
+RUN mkdir -p /data/papers /data/results /data/artifacts /data/model_cache \
+    /data/local_annotation_jobs /data/relation_jobs
 
 EXPOSE 8000
 
-# Railway supplies PORT at runtime. Proxy-header support lets FastAPI correctly
-# recognize the original HTTPS request made through Railway's reverse proxy.
-# One worker means only one in-memory copy of each model will be loaded later.
+# One replica is intentional while job state is stored in SQLite.
 CMD ["sh", "-c", "exec uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]

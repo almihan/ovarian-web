@@ -2,7 +2,9 @@ fastapi==0.141.1
 uvicorn[standard]>=0.35,<1
 Jinja2>=3.1.6,<4
 python-dotenv>=1.1,<2
-transformers>=4.49,<6
-torch>=2.4,<3
-safetensors>=0.5,<1
-openai>=1.0,<3
+requests>=2.32,<3
+urllib3>=2.0,<3
+boto3>=1.35,<2
+modal>=1.5,<2
+openai>=1.109,<3
+pyvis==0.3.2

@@ -1,0 +1,9 @@
+# Documentation only. modal_app.py installs these inside the Modal image.
+torch==2.4.1
+transformers==4.45.2
+safetensors>=0.5,<1
+numpy>=1.26,<3
+pyab3p>=0.1.1,<1
+huggingface-hub>=0.24,<1
+requests>=2.32,<3
+python-dotenv>=1.1,<2

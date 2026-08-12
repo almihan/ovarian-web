@@ -63,6 +63,9 @@ data/results/*
 data/model_cache/*
 !data/model_cache/.gitkeep
 
+data/network_jobs/*
+!data/network_jobs/.gitkeep
+
 # Downloaded or generated files
 uploads/
 downloads/
