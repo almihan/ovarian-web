@@ -117,7 +117,6 @@ def warm_model_cache(
     volumes={"/model-cache": model_cache_volume},
     cpu=2,
     memory=12288,
-    ephemeral_disk=20480,
     timeout=21600,
     max_containers=1,
     scaledown_window=10,
