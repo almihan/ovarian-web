@@ -173,6 +173,52 @@ function removeNetworkTooltips(items) {
     });
 }
 
+function nodeColorForType(entityType) {
+    const type = String(entityType || "").toLowerCase();
+    if (type === "cell") return "#458B73";
+    if (type === "gene") return "#FFAA00";
+    if (type === "hormone") return "#9B6AD6";
+    return "#6C757D";
+}
+
+function edgeColorForPredicate(predicate) {
+    const value = String(predicate || "").toLowerCase();
+    if (["inhibition", "downregulation"].includes(value)) return "#C64B4B";
+    if (value === "binding") return "#4F72B8";
+    if (value === "biosynthesis") return "#7A63B8";
+    if (value === "secreted") return "#2D8C87";
+    return "#2F8B68";
+}
+
+function normalizeNetworkNodes(nodes) {
+    return removeNetworkTooltips(nodes).map((node) => {
+        if (node.node_kind === "ontology" || node.ontology_only) return node;
+        const baseColor = nodeColorForType(node.entity_type || node.group);
+        return {
+            ...node,
+            color: {
+                background: baseColor,
+                border: baseColor,
+                highlight: { background: baseColor, border: baseColor },
+                hover: { background: baseColor, border: baseColor },
+            },
+            borderWidth: Number(node.borderWidth ?? 1),
+            borderWidthSelected: Number(node.borderWidthSelected ?? 2),
+        };
+    });
+}
+
+function normalizeNetworkEdges(edges) {
+    return removeNetworkTooltips(edges).map((edge) => {
+        if (edge.edge_kind === "hierarchy") return edge;
+        const color = edgeColorForPredicate(edge.predicate || edge.label);
+        return {
+            ...edge,
+            color: { color, highlight: color, hover: color, opacity: 0.86 },
+        };
+    });
+}
+
 function typePill(type, text = null) {
     const safeType = ["cell", "gene", "hormone"].includes(String(type)) ? String(type) : "edge";
     return `<span class="type-pill ${safeType}">${escapeHtml(text || formatType(type))}</span>`;
@@ -511,10 +557,10 @@ function buildNetwork(payload, { replace = true } = {}) {
     if (!window.vis?.DataSet || !window.vis?.Network) {
         throw new Error("The PyVis/vis-network browser library could not be loaded.");
     }
-    const incomingNodes = removeNetworkTooltips(Array.isArray(payload?.nodes) ? payload.nodes : []);
+    const incomingNodes = normalizeNetworkNodes(Array.isArray(payload?.nodes) ? payload.nodes : []);
     // Preserve the server-provided predicate labels and edge fonts for initial,
     // filtered, and incrementally inserted relation payloads.
-    const incomingEdges = removeNetworkTooltips(Array.isArray(payload?.edges) ? payload.edges : []);
+    const incomingEdges = normalizeNetworkEdges(Array.isArray(payload?.edges) ? payload.edges : []);
     if (!state.network || replace) {
         state.nodes = new window.vis.DataSet(incomingNodes);
         state.edges = new window.vis.DataSet(incomingEdges);

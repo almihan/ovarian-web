@@ -344,6 +344,11 @@ _GRAPH_OPTIONS: dict[str, Any] = {
         "borderWidth": 1,
         "borderWidthSelected": 2,
     },
+    "groups": {
+        "cell": {"color": {"background": "#458B73", "border": "#458B73"}},
+        "gene": {"color": {"background": "#FFAA00", "border": "#FFAA00"}},
+        "hormone": {"color": {"background": "#9B6AD6", "border": "#9B6AD6"}},
+    },
     "edges": {
         "smooth": {"type": "dynamic"},
         "arrows": {"to": {"enabled": True, "scaleFactor": 0.35}},
