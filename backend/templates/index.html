@@ -108,7 +108,7 @@
                             <div class="stage-panel-main">
                                 <div class="stage-panel-heading">
                                     <span class="stage-panel-icon retrieval"><svg class="icon"><use href="#icon-search"></use></svg></span>
-                                    <div><span>Stage 1 of 4</span><h3>Retrieve papers</h3><p>Reuse the shared default ovarian corpus, retrieve only papers added by this page's optional search, and create aligned chunks for downstream stages.</p></div>
+                                    <div><span>Stage 1 of 4</span><h3>Retrieve papers</h3></div>
                                 </div>
                                 <form id="analysisForm" class="pipeline-search-form" novalidate>
                                     <div class="search-label-row">
@@ -118,7 +118,7 @@
                                         <svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg>
                                         <input id="queryInput" name="query" type="text" maxlength="4000" placeholder="macrophage, granulosa cells, not cancer, PMID:12345678, PMC1234567" autocomplete="off">
                                     </div>
-                                    <p class="field-help">The built-in default query is always included. Separate optional keywords, exclusions, PMIDs, and PMCIDs with commas. Custom additions are recomputed only for this page run.</p>
+                                    <p class="field-help">The built-in default query is always included. Optional terms add papers.</p>
                                     <p class="form-error" id="formError" role="alert" hidden></p>
                                 </form>
                                 <div class="stage-action-row">
@@ -130,7 +130,7 @@
                                 <div class="progress-card ready" id="retrievalProgressCard">
                                     <div class="progress-top"><div><span>Current status</span><strong class="progress-stage" id="retrievalProgressStage">Ready</strong></div><strong class="progress-percent" id="retrievalProgressPercent">0%</strong></div>
                                     <div class="progress-track" id="retrievalProgressTrack" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="retrievalProgressBar"></span></div>
-                                    <p id="retrievalProgressMessage">Start Stage 1 to load shared defaults and retrieve any custom additions.</p>
+                                    <p id="retrievalProgressMessage">Start Stage 1 to load the corpus and retrieve any papers added by your search.</p>
                                 </div>
                             </aside>
                             <section class="completion-card retrieval-completion-card" id="retrievalSummary" aria-live="polite" hidden>
@@ -146,7 +146,7 @@
                             <div class="stage-panel-main">
                                 <div class="stage-panel-heading">
                                     <span class="stage-panel-icon annotation"><svg class="icon"><use href="#icon-brain"></use></svg></span>
-                                    <div><span>Stage 2 of 4</span><h3>Extract and normalize entities</h3><p>Run CellExLink and PubTator3 to identify cell types, human genes/proteins, and hormones while preserving aligned document offsets.</p></div>
+                                    <div><span>Stage 2 of 4</span><h3>Extract and normalize entities</h3><p>Extract cell types, genes/protein and hormones.</p></div>
                                 </div>
                                 <div class="stage-tags" aria-label="Entity extraction outputs"><span>Cell types</span><span>Genes / proteins</span><span>Hormones</span></div>
                                 <form id="annotationForm" class="stage-action-form" novalidate>
@@ -168,7 +168,7 @@
                                 <div class="completion-heading"><span class="result-check"><svg class="icon"><use href="#icon-check"></use></svg></span><div><span id="annotationSummaryStatus">Entity extraction complete</span><h3 id="annotationSummaryMessage">Normalized cells, genes, and hormones are ready.</h3></div></div>
                                 <div class="completion-content">
                                     <div class="completion-metrics retrieval-metric-grid"><div><strong id="annotationMentionCount">0</strong><span>Cell types</span></div><div><strong id="annotationNormalizedCount">0</strong><span>Genes</span></div><div><strong id="annotationHormoneCount">0</strong><span>Hormones</span></div><div><strong id="annotationElapsed">0s</strong><span>Elapsed</span></div></div>
-                                    <div class="completion-actions"><a class="button button-secondary" id="downloadAnnotationsLink" href="#"><svg class="icon"><use href="#icon-download"></use></svg>Download annotations</a><button class="button button-next" type="button" data-stage-next="relation">Continue to relations<svg class="icon"><use href="#icon-arrow"></use></svg></button></div>
+                                    <div class="completion-actions"><a class="button button-secondary" id="downloadAnnotationsLink" href="#"><svg class="icon"><use href="#icon-download"></use></svg>Download annotations</a></div>
                                 </div>
                             </section>
                         </article>
@@ -177,9 +177,8 @@
                             <div class="stage-panel-main">
                                 <div class="stage-panel-heading">
                                     <span class="stage-panel-icon relation"><svg class="icon"><use href="#icon-link"></use></svg></span>
-                                    <div><span>Stage 3 of 4</span><h3>Extract biological relations</h3><p>Find evidence-supported activation, inhibition, proliferation, merged secretion/production, binding, upregulation, and downregulation relations.</p></div>
+                                    <div><span>Stage 3 of 4</span><h3>Extract biological relations</h3><p>Find evidence-supported activation, inhibition, proliferation, secretion, binding, upregulation, and downregulation relations.</p></div>
                                 </div>
-                                <div class="stage-tags" aria-label="Relation extraction outputs"><span>Validated triples</span><span>Cell context</span><span>Evidence text</span></div>
                                 <form id="relationForm" class="stage-action-form" novalidate>
                                     <div class="stage-action-row">
                                         <div class="stage-readiness" id="relationReadiness" data-state="locked"><i></i><div><strong id="relationReadinessTitle">Waiting for Stage 2</strong><span id="relationReadinessText">Complete entity extraction to unlock relation extraction.</span></div></div>
@@ -198,8 +197,8 @@
                             <section class="completion-card relation-completion-card" id="relationSummary" aria-live="polite" hidden>
                                 <div class="completion-heading"><span class="result-check"><svg class="icon"><use href="#icon-check"></use></svg></span><div><span id="relationSummaryStatus">Relation extraction complete</span><h3 id="relationSummaryMessage">Validated relation rows are ready.</h3></div></div>
                                 <div class="completion-content">
-                                    <div class="completion-metrics relation-metric-grid"><div><strong id="relationCount">0</strong><span>Relations</span></div><div><strong id="relationChunkCount">0</strong><span>Chunks</span></div><div><strong id="relationCacheRate">0%</strong><span>Cached input</span></div><div><strong id="relationElapsed">0s</strong><span>Elapsed</span></div></div>
-                                    <div class="completion-actions"><a class="button button-secondary" id="downloadRelationsLink" href="#"><svg class="icon"><use href="#icon-download"></use></svg>Download relations</a><button class="button button-next" type="button" data-stage-next="network">Continue to network<svg class="icon"><use href="#icon-arrow"></use></svg></button></div>
+                                    <div class="completion-metrics relation-metric-grid"><div><strong id="relationCount">0</strong><span>Relations</span></div><div><strong id="relationChunkCount">0</strong><span>Chunks</span></div><div><strong id="relationElapsed">0s</strong><span>Elapsed</span></div></div>
+                                    <div class="completion-actions"><a class="button button-secondary" id="downloadRelationsLink" href="#"><svg class="icon"><use href="#icon-download"></use></svg>Download relations</a></div>
                                 </div>
                             </section>
                         </article>
@@ -208,9 +207,8 @@
                             <div class="stage-panel-main">
                                 <div class="stage-panel-heading">
                                     <span class="stage-panel-icon network"><svg class="icon"><use href="#icon-network"></use></svg></span>
-                                    <div><span>Stage 4 of 4</span><h3>Build and explore the interaction network</h3><p>Build a temporary searchable evidence-linked network for this page run, with binding displayed without direction. Stage 4 is not saved in shared storage.</p></div>
+                                    <div><span>Stage 4 of 4</span><h3>Build and explore the interaction network</h3><p>Build a searchable evidence-linked network.</p></div>
                                 </div>
-                                <div class="stage-tags" aria-label="Network outputs"><span>Searchable graph</span><span>Evidence explorer</span><span>Temporary index</span></div>
                                 <form id="networkForm" class="stage-action-form" novalidate>
                                     <div class="stage-action-row">
                                         <div class="stage-readiness" id="networkReadiness" data-state="locked"><i></i><div><strong id="networkReadinessTitle">Waiting for Stage 3</strong><span id="networkReadinessText">Complete relation extraction to unlock network generation.</span></div></div>
@@ -229,7 +227,7 @@
                             <section class="completion-card network-completion-card" id="networkSummary" aria-live="polite" hidden>
                                 <div class="completion-heading"><span class="result-check"><svg class="icon"><use href="#icon-check"></use></svg></span><div><span id="networkSummaryStatus">Network complete</span><h3 id="networkSummaryMessage">Your interaction network is ready.</h3></div></div>
                                 <div class="completion-content">
-                                    <div class="completion-metrics network-metric-grid"><div><strong id="networkNodeCount">0</strong><span>Nodes</span></div><div><strong id="networkEdgeCount">0</strong><span>Edges</span></div><div><strong id="networkPaperCount">0</strong><span>Papers</span></div><div><strong id="networkElapsed">0s</strong><span>Elapsed</span></div></div>
+                                    <div class="completion-metrics network-metric-grid"><div><strong id="networkNodeCount">0</strong><span>Nodes</span></div><div><strong id="networkEdgeCount">0</strong><span>Edges</span></div><div><strong id="networkElapsed">0s</strong><span>Elapsed</span></div></div>
                                     <div class="completion-actions"><a class="button button-primary" id="openNetworkLink" href="#"><svg class="icon"><use href="#icon-network"></use></svg>Open network</a></div>
                                 </div>
                             </section>

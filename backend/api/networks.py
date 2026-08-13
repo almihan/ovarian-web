@@ -173,6 +173,23 @@ def relation_types(
     }
 
 
+@router.get("/{job_id}/graph/full")
+def full_graph(
+    job_id: str,
+    relation_support_min: int = Query(default=1, ge=0),
+) -> dict[str, Any]:
+    """Return every supported edge and endpoint node for the current network."""
+
+    _ready_job(job_id)
+    try:
+        return network_repository.full_graph(
+            job_id,
+            relation_support_min=relation_support_min,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.get("/{job_id}/graph/relations")
 def relation_type_graph(
     job_id: str,

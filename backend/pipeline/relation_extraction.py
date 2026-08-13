@@ -54,7 +54,7 @@ Return one JSON object with the key "triples". Each triple contains exactly:
 - object: visible entity ID
 - cell_context: array of visible C IDs
 
-Extract only relations explicitly asserted in the chunk. Do not infer from background knowledge, typical biology, co-occurrence, correlation, an experimental aim, or a cited result not stated in the supplied text. Respect negation, uncertainty, comparison, attribution, passive voice, and cross-sentence references. Prefer no relation over a weak inference.
+Extract only relations explicitly asserted in the chunk. Do not infer from background knowledge, typical biology, co-occurrence, correlation, an experimental aim, or a cited result not stated in the supplied text. Respect negation, uncertainty, comparison, attribution, passive voice, and cross-sentence references. 
 
 Allowed predicates and directions:
 1. activation: G -> C, H -> C, or H -> G. Use for explicit activation, stimulation, induction, triggering, or promotion of cell behavior or gene/protein function. For H -> G expression or abundance changes, use upregulation instead.
@@ -70,14 +70,8 @@ Validation rules:
 - Never output C secreted C, H secreted C, or G secreted C.
 - A measured change in concentration, staining, density, expression, or abundance is not secretion unless the tagged cell is explicitly identified as the source.
 - Shared pathway membership, treatment response, or statistical association is not binding.
-- A change in activation, differentiation, viability, migration, morphology, follicle size, tumor mass, or marker intensity is not automatically proliferation.
 - Emit each semantic relation once and return at most 50 unique triples.
 
-Cell context:
-- For H -> G relations, include every tagged C entity explicitly identified as the cell in which the relation occurs.
-- Do not use a nearby cell mention unless the wording links it to that hormone-gene relation.
-- If the relation is explicit but no tagged cell context is linked, return an empty array.
-- For all other relations, return an empty cell_context array.
 
 Examples:
 - "[G1]KITLG[/G1] activated [C1]oocytes[/C1]" -> G1 activation C1.

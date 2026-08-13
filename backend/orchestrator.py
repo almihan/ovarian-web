@@ -327,8 +327,10 @@ class PipelineOrchestrator:
         if run["stages"][previous].get("status") != "completed":
             raise RuntimeError(f"{previous.title()} must complete first.")
         current = run["stages"][stage_name]
-        if current.get("status") in {"queued", "processing", "completed"}:
+        if current.get("status") in {"queued", "processing"}:
             return run_registry.public(run_id)
+        if current.get("status") == "completed":
+            run_registry.reset_downstream_stages(run_id, stage_name)
         run_registry.start_stage(
             run_id,
             stage_name,

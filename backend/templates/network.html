@@ -7,7 +7,7 @@
     <title>Interaction Network · {{ app_name }}</title>
     <link rel="icon" type="image/svg+xml" href="/static/images/favicon.svg">
     <link rel="stylesheet" href="/vendor/vis-network.css?v=9.1.2">
-    <link rel="stylesheet" href="/static/css/network.css?v=20260811-paper-links-relation-types-1">
+    <link rel="stylesheet" href="/static/css/network.css?v=20260813-view-actions-1">
 </head>
 <body
     data-network-job-id="{{ network_job_id }}"
@@ -22,15 +22,9 @@
             <img src="/static/images/logo-mark.svg" alt="" width="36" height="36">
             <span><strong>Ovarian Network</strong><small>Interaction explorer</small></span>
         </a>
-        <div class="header-stats" aria-live="polite">
-            <span><strong id="headerNodeCount">—</strong> nodes</span>
-            <span><strong id="headerEdgeCount">—</strong> edges</span>
-            <span><strong id="headerPaperCount">—</strong> papers</span>
-        </div>
         <div class="header-actions">
             <button class="ghost-button" id="fitNetwork" type="button">Fit view</button>
-            <button class="ghost-button" id="togglePhysics" type="button" aria-pressed="true">Pause physics</button>
-            <a class="primary-link" href="/">Pipeline</a>
+            <a class="primary-link" id="returnHome" href="/">Home</a>
         </div>
     </header>
 
@@ -53,16 +47,19 @@
                 <div class="network-filter-grid">
                     <label>
                         <span class="field-label">Top nodes</span>
-                        <input id="topNodeCount" type="number" min="1" max="{{ max_initial_nodes }}" step="1" value="{{ initial_nodes }}" inputmode="numeric">
+                        <input id="topNodeCount" type="number" min="0" max="{{ max_initial_nodes }}" step="1" value="0" inputmode="numeric">
                     </label>
                     <label>
                         <span class="field-label">Relation support ≥</span>
                         <input id="relationSupportMin" type="number" min="0" step="1" value="1" inputmode="numeric">
                     </label>
                 </div>
-                <button class="secondary-button full-width filter-apply-button" id="resetNetwork" type="button">Apply to initial view</button>
-                <button class="hierarchy-button full-width hierarchy-open-button" id="showCellHierarchy" type="button">Show Cell Ontology hierarchy</button>
-                <p class="control-help">Nodes are ranked by the number of distinct supporting papers. A relation is shown only when its paper support is greater than or equal to the entered threshold. There is no top-relations selection.</p>
+                <div class="view-action-group">
+                    <button class="secondary-button view-action-button primary-view-action" id="resetNetwork" type="button">Apply to initial view</button>
+                    <button class="secondary-button view-action-button" id="resetFullGraph" type="button">Reset full graph</button>
+                    <button class="hierarchy-button view-action-button" id="showCellHierarchy" type="button">Show Cell Ontology hierarchy</button>
+                </div>
+                <p class="control-help">Nodes are ranked by the number of distinct supporting papers. A relation is shown only when its paper support is greater than or equal to the entered threshold.</p>
 
                 <div class="panel-divider"></div>
 
@@ -86,11 +83,9 @@
 
                 <label class="field-label" for="nodeSearch">Select node</label>
                 <div class="search-control">
-                    <input id="nodeSearch" type="search" maxlength="160" placeholder="Search label, synonym, CL, Gene ID, or hormone ID" autocomplete="off">
+                    <input id="nodeSearch" type="text" maxlength="160" placeholder="Cell name/ID, gene, or hormone" autocomplete="off" aria-controls="nodeSearchOptions">
+                    <div class="node-search-options" id="nodeSearchOptions" hidden></div>
                     <span id="searchSpinner" hidden aria-label="Searching"></span>
-                </div>
-                <div class="search-results" id="nodeSearchResults" aria-live="polite">
-                    <p class="empty-copy">Type at least one character to search the complete network.</p>
                 </div>
                 <div class="selected-node-card" id="selectedSearchNode" hidden>
                     <span id="selectedSearchType">Entity</span>
@@ -112,7 +107,6 @@
                     <div><i class="node-swatch cell"></i><span>Cell / cell type</span></div>
                     <div><i class="node-swatch gene"></i><span>Gene / protein</span></div>
                     <div><i class="node-swatch hormone"></i><span>Hormone</span></div>
-                    <div><i class="node-swatch hierarchy"></i><span>Cell Ontology hierarchy-only term</span></div>
                     <div><i class="edge-swatch positive"></i><span>Positive / other directed relation</span></div>
                     <div><i class="edge-swatch negative"></i><span>Inhibition / downregulation</span></div>
                     <div><i class="edge-swatch binding"></i><span>Undirected binding</span></div>
@@ -165,10 +159,7 @@
         </aside>
 
         <section class="network-stage" aria-label="Interactive interaction network">
-            <div class="network-status-bar">
-                <span id="networkStatusText">Preparing network explorer…</span>
-                <span id="stabilizationStatus"></span>
-            </div>
+            <span id="networkStatusText" hidden>Preparing network explorer…</span>
             <div id="networkCanvas" role="application" aria-label="Directed ovarian interaction network"></div>
 
             <div class="build-overlay" id="buildOverlay" aria-live="polite">
@@ -186,6 +177,6 @@
 
     <div class="network-toast" id="networkToast" role="status" hidden></div>
     <script src="/vendor/vis-network.min.js?v=9.1.2" defer></script>
-    <script src="/static/js/network.js?v=20260811-paper-links-relation-types-1" defer></script>
+    <script src="/static/js/network.js?v=20260813-full-reset-1" defer></script>
 </body>
 </html>

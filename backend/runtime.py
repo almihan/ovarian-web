@@ -202,6 +202,26 @@ class RunRegistry:
             record["private"][key] = deepcopy(value)
             record["updated_at"] = utc_now()
 
+    def reset_downstream_stages(self, run_id: str, stage_name: str) -> None:
+        """Discard results that depend on a stage before that stage is rerun."""
+
+        if stage_name not in _STAGE_ORDER:
+            raise KeyError(stage_name)
+        index = _STAGE_ORDER.index(stage_name)
+        private_prefixes = tuple(
+            f"stage{number}_" for number in range(index + 1, len(_STAGE_ORDER) + 1)
+        )
+        with self._lock:
+            record = self._runs.get(run_id)
+            if record is None:
+                raise KeyError(run_id)
+            for name in _STAGE_ORDER[index + 1 :]:
+                record["stages"][name] = _new_stage(name)
+            for key in tuple(record["private"]):
+                if key.startswith(private_prefixes) or key in {"graph_path", "entity_index_path"}:
+                    del record["private"][key]
+            record["updated_at"] = utc_now()
+
     def get_private(self, run_id: str, key: str, default: Any = None) -> Any:
         with self._lock:
             record = self._runs.get(run_id)

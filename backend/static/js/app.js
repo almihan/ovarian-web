@@ -14,16 +14,16 @@ const REQUEST_TIMEOUT_MS = 30000;
 const STAGES = ["retrieval", "annotation", "relation", "network"];
 const STAGE_NUMBERS = { annotation: 2, relation: 3, network: 4 };
 const STAGE_DEFAULTS = {
-    retrieval: "Start Stage 1 to load the shared default corpus and retrieve any papers added by your search.",
+    retrieval: "Start Stage 1 to load the corpus and retrieve any papers added by your search.",
     annotation: "Complete Stage 1 to begin entity extraction.",
     relation: "Complete Stage 2 to begin relation extraction.",
     network: "Complete Stage 3 to build the temporary interaction network.",
 };
 const READY_COPY = {
     retrieval: ["Ready to retrieve", "The built-in default query is always included. Optional terms add papers only to this page run."],
-    annotation: ["Stage 1 is ready", "Extract cells with CellExLink and genes/hormones with PubTator3."],
-    relation: ["Stage 2 is ready", "Extract evidence-supported relations from the aligned entity artifact."],
-    network: ["Stage 3 is ready", "Build a temporary searchable graph for this page run."],
+    annotation: ["Stage 2 is ready", "Extract cells with CellExLink and genes/hormones with PubTator3."],
+    relation: ["Stage 3 is ready", "Extract evidence-supported relations from the text."],
+    network: ["Stage 4 is ready", "Build a searchable evidence-linked network."],
 };
 const LOCKED_COPY = {
     retrieval: READY_COPY.retrieval,
@@ -252,7 +252,6 @@ function renderRelationSummary(record) {
     $("#relationSummaryMessage").textContent = record.message || "Validated relation rows are ready.";
     $("#relationCount").textContent = Number(stats.relation_count || 0).toLocaleString();
     $("#relationChunkCount").textContent = Number(stats.chunk_count || 0).toLocaleString();
-    $("#relationCacheRate").textContent = formatPercent(stats.prompt_cache_rate || 0);
     $("#relationElapsed").textContent = formatDuration(record.elapsed_seconds ?? stats.elapsed_seconds);
     $("#downloadRelationsLink").href = record.download_url || "#";
     $("#relationSummary").hidden = false;
@@ -264,7 +263,6 @@ function renderNetworkSummary(record) {
     $("#networkSummaryMessage").textContent = record.message || "Your temporary interaction network is ready.";
     $("#networkNodeCount").textContent = Number(stats.node_count || 0).toLocaleString();
     $("#networkEdgeCount").textContent = Number(stats.edge_count || 0).toLocaleString();
-    $("#networkPaperCount").textContent = Number(stats.paper_count || 0).toLocaleString();
     $("#networkElapsed").textContent = formatDuration(record.elapsed_seconds ?? stats.elapsed_seconds);
     $("#openNetworkLink").href = record.open_url || (state.runId ? `/network/${encodeURIComponent(state.runId)}` : "#");
     $("#networkSummary").hidden = false;
@@ -303,7 +301,8 @@ function renderButtons(run) {
         const button = $(`#start${stage[0].toUpperCase()}${stage.slice(1)}`);
         if (!button) continue;
         const busy = ["queued", "processing"].includes(record.status);
-        button.disabled = !["ready", "failed"].includes(record.status);
+        button.disabled = !["ready", "failed"].includes(record.status)
+            && !(record.status === "completed");
         button.classList.toggle("loading", busy);
         const label = $("span", button);
         if (!label) continue;
@@ -421,15 +420,4 @@ document.addEventListener("DOMContentLoaded", () => {
     initializeNavigation();
     initializeForms();
     resetInterface({ clearQuery: true });
-});
-
-// Browsers can restore a page from their in-memory back/forward cache. Drop
-// the previous run before that snapshot can be shown again.
-window.addEventListener("pagehide", () => {
-    state.runId = null;
-    state.pollGeneration += 1;
-});
-
-window.addEventListener("pageshow", (event) => {
-    if (event.persisted) resetInterface({ clearQuery: true });
 });

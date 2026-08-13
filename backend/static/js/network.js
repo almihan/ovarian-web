@@ -22,6 +22,7 @@ const state = {
     selection: null,
     evidence: [],
     searchGeneration: 0,
+    nodeSearchResults: [],
     toastTimer: null,
     graphLoaded: false,
     hierarchySignature: "",
@@ -90,6 +91,12 @@ function currentRelationSupportMin() {
     return integerInputValue("#relationSupportMin", defaultRelationSupportMin, 0);
 }
 
+function currentTopNodeCount() {
+    const input = $("#topNodeCount");
+    if (!input?.value.trim() || Number(input.value) <= 0) return defaultInitialNodes;
+    return integerInputValue("#topNodeCount", defaultInitialNodes, 1, maxInitialNodes);
+}
+
 function formatType(value) {
     const type = String(value || "entity").toLowerCase();
     return type === "gene" ? "Gene / protein" : type === "cell" ? "Cell / cell type" : type === "hormone" ? "Hormone" : "Entity";
@@ -153,16 +160,17 @@ function setBuildProgress(job) {
     $("#networkStatusText").textContent = job?.message || "Preparing network explorer…";
 }
 
-function setOverallStats(job, graphStats = null) {
-    const stats = graphStats || job?.stats || {};
-    $("#headerNodeCount").textContent = formatNumber(stats.node_count ?? job?.node_count);
-    $("#headerEdgeCount").textContent = formatNumber(stats.edge_count ?? job?.edge_count);
-    $("#headerPaperCount").textContent = formatNumber(stats.paper_count ?? job?.paper_count);
-}
-
 function setVisibleCounts() {
     $("#viewNodeCount").textContent = formatNumber(state.nodes?.length || 0);
     $("#viewEdgeCount").textContent = formatNumber(state.edges?.length || 0);
+}
+
+function removeNetworkTooltips(items) {
+    return items.map((item) => {
+        const copy = { ...item };
+        delete copy.title;
+        return copy;
+    });
 }
 
 function typePill(type, text = null) {
@@ -176,46 +184,26 @@ function detailRows(rows) {
 
 function renderNodeDetail(node) {
     const aliases = Array.isArray(node.aliases) ? node.aliases : [];
-    const predicates = Array.isArray(node.predicates) ? node.predicates : [];
-    const directionRows = [
-        ["Directed outgoing", formatNumber(node.outgoing_count)],
-        ["Directed incoming", formatNumber(node.incoming_count)],
-    ];
-    if (Number(node.undirected_count || 0) > 0) {
-        directionRows.push(["Undirected binding", formatNumber(node.undirected_count)]);
-    }
     $("#detailsHeading").textContent = node.label || node.id;
     $("#detailsSubheading").textContent = `${formatType(node.entity_type)} · normalized across the complete Stage 3 artifact`;
     $("#detailsContent").innerHTML = `
         <div class="detail-card">
             ${typePill(node.entity_type)}
             ${detailRows([
-                ["Global node ID", node.id],
                 ["Normalized identity", node.normalized_id],
+                ["Standard name", node.label || node.id],
                 ["Papers", formatNumber(node.paper_count)],
                 ["Chunks", formatNumber(node.chunk_count)],
                 ["Relations", formatNumber(node.relation_count)],
-                ...directionRows,
-                ["Cell-context uses", formatNumber(node.context_count)],
             ])}
         </div>
         <div class="detail-card">
-            <h3>Names and mentions</h3>
-            ${aliases.length ? `<ul class="detail-list">${aliases.map((item) => `<li><span>${escapeHtml(item.text)}</span><strong>${formatNumber(item.count)}</strong></li>`).join("")}</ul>` : '<p class="empty-copy">No additional aliases.</p>'}
-        </div>
-        <div class="detail-card">
-            <h3>Relation predicates</h3>
-            ${predicates.length ? `<ul class="detail-list">${predicates.map((item) => {
-                const direction = isUndirectedPredicate(item.predicate)
-                    ? `${formatNumber(item.undirected)} undirected`
-                    : `${formatNumber(item.outgoing)} out · ${formatNumber(item.incoming)} in`;
-                return `<li><span>${escapeHtml(item.predicate)}</span><strong>${formatNumber(item.evidence_count)} evidence · ${direction}</strong></li>`;
-            }).join("")}</ul>` : '<p class="empty-copy">No incident relations.</p>'}
+            <h3>Text mentions</h3>
+            ${aliases.length ? `<ul class="detail-list">${aliases.map((item) => `<li><span>${escapeHtml(item.text)}</span><strong>${formatNumber(item.count)} mention${Number(item.count) === 1 ? "" : "s"}</strong></li>`).join("")}</ul>` : '<p class="empty-copy">No text mentions were stored for this node.</p>'}
         </div>`;
 }
 
 function renderEdgeDetail(edge) {
-    const contexts = Array.isArray(edge.cell_contexts) ? edge.cell_contexts : [];
     const undirected = edge.directed === false || isUndirectedPredicate(edge.predicate);
     const firstEndpointLabel = undirected ? "Endpoint 1" : "Subject";
     const secondEndpointLabel = undirected ? "Endpoint 2" : "Object";
@@ -229,18 +217,12 @@ function renderEdgeDetail(edge) {
         <div class="detail-card">
             ${typePill("edge", undirected ? "Undirected relation" : "Directed relation")}
             ${detailRows([
-                ["Edge ID", edge.id],
                 [firstEndpointLabel, `${edge.subject_label || edge.subject_id} (${formatType(edge.subject_type)})`],
                 ["Predicate", edge.predicate],
                 [secondEndpointLabel, `${edge.object_label || edge.object_id} (${formatType(edge.object_type)})`],
                 ["Papers", formatNumber(edge.paper_count)],
                 ["Chunks / evidence", formatNumber(edge.evidence_count)],
-                ["Evidence with cell context", formatNumber(edge.context_evidence_count)],
             ])}
-        </div>
-        <div class="detail-card">
-            <h3>Explicit cell contexts</h3>
-            ${contexts.length ? `<ul class="detail-list">${contexts.map((item) => `<li><span>${escapeHtml(item.label)}</span><strong>${formatNumber(item.evidence_count)} passage${Number(item.evidence_count) === 1 ? "" : "s"}</strong></li>`).join("")}</ul>` : '<p class="empty-copy">No explicit tagged-cell context was attached to this relation.</p>'}
         </div>`;
 }
 
@@ -496,7 +478,7 @@ async function openSelectionEvidence() {
             : `evidence/nodes/${encodeURIComponent(state.selection.id)}`;
         const payload = await requestJson(`/api/networks/${encodeURIComponent(jobId)}/${path}`);
         state.evidence = Array.isArray(payload?.evidence) ? payload.evidence : [];
-        $("#evidenceSubheading").textContent = `${formatNumber(state.evidence.length)} supporting passage${state.evidence.length === 1 ? "" : "s"} loaded. Filtering is local and does not request the server again.`;
+        $("#evidenceSubheading").textContent = `${formatNumber(state.evidence.length)} supporting passage${state.evidence.length === 1 ? "" : "s"} loaded.`;
         renderEvidence();
     } catch (error) {
         state.evidence = [];
@@ -520,25 +502,19 @@ function bindNetworkEvents() {
         setVisibleCounts();
         showToast("Node removed from this browser view. Use Select node to add it again.");
     });
-    state.network.on("stabilizationProgress", (params) => {
-        const percent = params.total ? Math.round(100 * params.iterations / params.total) : 0;
-        $("#stabilizationStatus").textContent = `Layout ${percent}%`;
-    });
     state.network.on("stabilizationIterationsDone", () => {
-        $("#stabilizationStatus").textContent = "Layout ready";
         state.network.setOptions({ physics: { stabilization: false } });
     });
-    state.network.on("dragEnd", () => { $("#stabilizationStatus").textContent = ""; });
 }
 
 function buildNetwork(payload, { replace = true } = {}) {
     if (!window.vis?.DataSet || !window.vis?.Network) {
         throw new Error("The PyVis/vis-network browser library could not be loaded.");
     }
-    const incomingNodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+    const incomingNodes = removeNetworkTooltips(Array.isArray(payload?.nodes) ? payload.nodes : []);
     // Preserve the server-provided predicate labels and edge fonts for initial,
     // filtered, and incrementally inserted relation payloads.
-    const incomingEdges = Array.isArray(payload?.edges) ? payload.edges : [];
+    const incomingEdges = removeNetworkTooltips(Array.isArray(payload?.edges) ? payload.edges : []);
     if (!state.network || replace) {
         state.nodes = new window.vis.DataSet(incomingNodes);
         state.edges = new window.vis.DataSet(incomingEdges);
@@ -549,8 +525,6 @@ function buildNetwork(payload, { replace = true } = {}) {
             payload?.options || {},
         );
         state.physicsEnabled = true;
-        $("#togglePhysics").textContent = "Pause physics";
-        $("#togglePhysics").setAttribute("aria-pressed", "true");
         bindNetworkEvents();
     } else {
         // Incremental insertion is intentional: no clear(), replacement, or reset.
@@ -560,7 +534,6 @@ function buildNetwork(payload, { replace = true } = {}) {
         state.network.setOptions({ physics: { enabled: state.physicsEnabled } });
     }
     setVisibleCounts();
-    setOverallStats(state.job, payload?.network_stats);
     state.graphLoaded = true;
     state.hierarchySignature = "";
     $("#buildOverlay").hidden = true;
@@ -678,7 +651,7 @@ async function loadRelationTypeGraph() {
 }
 
 async function loadInitialGraph() {
-    const count = integerInputValue("#topNodeCount", defaultInitialNodes, 1, maxInitialNodes);
+    const count = currentTopNodeCount();
     const supportMin = currentRelationSupportMin();
     $("#networkStatusText").textContent = `Loading the top ${formatNumber(count)} nodes ranked by supporting papers; relation support ≥ ${formatNumber(supportMin)} paper(s)…`;
     const payload = await requestJson(
@@ -692,23 +665,37 @@ async function loadInitialGraph() {
     window.setTimeout(() => state.network?.fit({ animation: { duration: 450, easingFunction: "easeInOutQuad" } }), 150);
 }
 
-function renderSearchResults(nodes) {
-    const container = $("#nodeSearchResults");
-    if (!nodes.length) {
-        container.innerHTML = '<p class="empty-copy">No matching normalized nodes.</p>';
-        return;
+async function loadFullGraph() {
+    const supportMin = currentRelationSupportMin();
+    const button = $("#resetFullGraph");
+    if (button) button.disabled = true;
+    $("#networkStatusText").textContent = `Loading the full graph with relation support ≥ ${formatNumber(supportMin)} paper(s)…`;
+    try {
+        const payload = await requestJson(
+            `/api/networks/${encodeURIComponent(jobId)}/graph/full?relation_support_min=${encodeURIComponent(supportMin)}`,
+            { timeoutMs: 120000 },
+        );
+        buildNetwork(payload, { replace: true });
+        state.viewMode = "full";
+        setRelationTypeSelection([]);
+        $("#networkStatusText").textContent = `${formatNumber(state.nodes.length)} nodes and ${formatNumber(state.edges.length)} relations are visible.`;
+        window.setTimeout(() => state.network?.fit({ animation: { duration: 450, easingFunction: "easeInOutQuad" } }), 150);
+    } catch (error) {
+        showToast(error.message);
+    } finally {
+        if (button) button.disabled = false;
     }
-    container.innerHTML = nodes.map((node) => `
-        <button class="search-result" type="button" data-node-id="${escapeHtml(node.id)}">
-            <i class="result-dot ${escapeHtml(node.entity_type)}" aria-hidden="true"></i>
-            <span><strong>${escapeHtml(node.label)}</strong><small>${escapeHtml(formatType(node.entity_type))} · ${formatNumber(node.paper_count)} papers · ${formatNumber(node.relation_count)} relations · ${escapeHtml(node.normalized_id || node.id)}</small></span>
+}
+
+function renderNodeSearchOptions(nodes) {
+    const options = $("#nodeSearchOptions");
+    if (!options) return;
+    options.innerHTML = nodes.map((node, index) => `
+        <button class="node-search-option" type="button" data-node-index="${index}">
+            <strong>${escapeHtml(node.label || node.id)}</strong>
+            <small>${escapeHtml(formatType(node.entity_type))} · ${escapeHtml(node.normalized_id || node.id)}</small>
         </button>`).join("");
-    $$(".search-result", container).forEach((button) => {
-        button.addEventListener("click", () => {
-            const node = nodes.find((item) => item.id === button.dataset.nodeId);
-            if (node) selectSearchNode(node);
-        });
-    });
+    options.hidden = nodes.length === 0;
 }
 
 function selectSearchNode(node) {
@@ -719,6 +706,7 @@ function selectSearchNode(node) {
     $("#selectedSearchId").textContent = node.normalized_id || node.id;
     $("#selectedSearchNode").hidden = false;
     $("#addSelectedNode").disabled = false;
+    $("#nodeSearchOptions").hidden = true;
 }
 
 async function searchNodes() {
@@ -726,7 +714,8 @@ async function searchNodes() {
     state.searchGeneration += 1;
     const generation = state.searchGeneration;
     if (!query) {
-        $("#nodeSearchResults").innerHTML = '<p class="empty-copy">Type at least one character to search the complete network.</p>';
+        state.nodeSearchResults = [];
+        renderNodeSearchOptions([]);
         $("#searchSpinner").hidden = true;
         return;
     }
@@ -734,9 +723,14 @@ async function searchNodes() {
     try {
         const payload = await requestJson(`/api/networks/${encodeURIComponent(jobId)}/nodes/search?q=${encodeURIComponent(query)}`);
         if (generation !== state.searchGeneration) return;
-        renderSearchResults(Array.isArray(payload?.nodes) ? payload.nodes : []);
+        state.nodeSearchResults = Array.isArray(payload?.nodes) ? payload.nodes : [];
+        renderNodeSearchOptions(state.nodeSearchResults);
     } catch (error) {
-        if (generation === state.searchGeneration) $("#nodeSearchResults").innerHTML = `<p class="empty-copy">${escapeHtml(error.message)}</p>`;
+        if (generation === state.searchGeneration) {
+            state.nodeSearchResults = [];
+            renderNodeSearchOptions([]);
+            showToast(error.message);
+        }
     } finally {
         if (generation === state.searchGeneration) $("#searchSpinner").hidden = true;
     }
@@ -911,7 +905,6 @@ async function pollJobUntilReady() {
         const job = await requestJson(`/api/networks/${encodeURIComponent(jobId)}`);
         state.job = job;
         setBuildProgress(job);
-        setOverallStats(job);
         if (job.status === "completed") return job;
         if (job.status === "failed") throw new Error(job.error || job.message || "Network generation failed.");
         await sleep(JOB_POLL_MS);
@@ -919,24 +912,31 @@ async function pollJobUntilReady() {
 }
 
 function bindControls() {
+    $("#returnHome")?.addEventListener("click", (event) => {
+        if (window.history.length <= 1) return;
+        event.preventDefault();
+        window.history.back();
+    });
     $$(".tab-button").forEach((button) => button.addEventListener("click", () => {
         const tab = button.dataset.tab;
         activateTab(tab);
         if (tab === "hierarchy") void showCellHierarchy({ activate: false });
     }));
     $("#fitNetwork")?.addEventListener("click", () => state.network?.fit({ animation: { duration: 450, easingFunction: "easeInOutQuad" } }));
-    $("#togglePhysics")?.addEventListener("click", () => {
-        if (!state.network) return;
-        state.physicsEnabled = !state.physicsEnabled;
-        state.network.setOptions({ physics: { enabled: state.physicsEnabled, stabilization: false } });
-        $("#togglePhysics").textContent = state.physicsEnabled ? "Pause physics" : "Resume physics";
-        $("#togglePhysics").setAttribute("aria-pressed", String(state.physicsEnabled));
-    });
     $("#resetNetwork")?.addEventListener("click", async () => {
         try {
             await loadRelationTypes({ preserveSelection: false });
             await loadInitialGraph();
             showToast("The paper-ranked node and relation-support filters were applied.");
+        } catch (error) {
+            showToast(error.message);
+        }
+    });
+    $("#resetFullGraph")?.addEventListener("click", async () => {
+        try {
+            await loadRelationTypes({ preserveSelection: false });
+            await loadFullGraph();
+            showToast("The full graph was restored.");
         } catch (error) {
             showToast(error.message);
         }
@@ -962,6 +962,27 @@ function bindControls() {
         window.clearTimeout(searchTimer);
         searchTimer = window.setTimeout(() => void searchNodes(), 250);
     });
+    $("#nodeSearch")?.addEventListener("change", () => {
+        const value = String($("#nodeSearch")?.value || "").trim().toLocaleLowerCase();
+        const node = state.nodeSearchResults.find((item) =>
+            [item.label, item.normalized_id, item.id]
+                .some((candidate) => String(candidate || "").toLocaleLowerCase() === value)
+        );
+        if (node) selectSearchNode(node);
+    });
+    $("#nodeSearchOptions")?.addEventListener("click", (event) => {
+        const option = event.target.closest("[data-node-index]");
+        if (!option) return;
+        const node = state.nodeSearchResults[Number(option.dataset.nodeIndex)];
+        if (!node) return;
+        $("#nodeSearch").value = node.label || node.id;
+        selectSearchNode(node);
+    });
+    document.addEventListener("click", (event) => {
+        if (event.target.closest(".search-control")) return;
+        const options = $("#nodeSearchOptions");
+        if (options) options.hidden = true;
+    });
     $("#addSelectedNode")?.addEventListener("click", () => void addSelectedNode());
     $("#showCellHierarchy")?.addEventListener("click", () => void showCellHierarchy());
     $("#showSelectionEvidence")?.addEventListener("click", () => void openSelectionEvidence());
@@ -970,7 +991,6 @@ function bindControls() {
 
 async function initialize() {
     bindControls();
-    integerInputValue("#topNodeCount", defaultInitialNodes, 1, maxInitialNodes);
     integerInputValue("#relationSupportMin", defaultRelationSupportMin, 0);
     try {
         await pollJobUntilReady();

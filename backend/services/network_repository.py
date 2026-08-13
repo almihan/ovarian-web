@@ -56,6 +56,21 @@ _HIERARCHY_NODE_COLOR = {
 }
 
 
+def _scale_size(
+    value: int,
+    min_value: int,
+    max_value: int,
+    out_min: float = 8.0,
+    out_max: float = 32.0,
+) -> float:
+    if max_value <= min_value:
+        return (out_min + out_max) / 2.0
+    fraction = (math.log1p(value) - math.log1p(min_value)) / (
+        math.log1p(max_value) - math.log1p(min_value)
+    )
+    return out_min + fraction * (out_max - out_min)
+
+
 class _FallbackNetwork:
     """Small test/development fallback; deployments install the PyVis dependency."""
 
@@ -142,17 +157,26 @@ def _edge_color(predicate: str) -> str:
     return _EDGE_COLORS.get(predicate, "#2F8B68")
 
 
-def _node_payload(node: Mapping[str, Any]) -> dict[str, Any]:
+def _node_payload(
+    node: Mapping[str, Any], *, min_paper_count: int, max_paper_count: int
+) -> dict[str, Any]:
     relation_count = int(node.get("relation_count") or 0)
     paper_count = int(node.get("paper_count") or 0)
+    sizing_paper_count = max(1, paper_count)
+    entity_type = str(node.get("entity_type") or "")
+    base_color = {
+        "cell": "#458B73",
+        "gene": "#FFAA00",
+        "hormone": "#9B6AD6",
+    }.get(entity_type, "#6C757D")
     return {
         "id": str(node["id"]),
         "label": str(node.get("label") or node["id"]),
         "title": _node_title(node),
-        "group": str(node.get("entity_type") or "entity"),
+        "group": entity_type or "entity",
         "node_kind": "interaction",
         "ontology_only": False,
-        "entity_type": str(node.get("entity_type") or ""),
+        "entity_type": entity_type,
         "normalized_id": str(node.get("normalized_id") or ""),
         "cl_id": normalize_cl_id(node.get("normalized_id")),
         "paper_count": paper_count,
@@ -162,23 +186,40 @@ def _node_payload(node: Mapping[str, Any]) -> dict[str, Any]:
         "outgoing_count": int(node.get("outgoing_count") or 0),
         "context_count": int(node.get("context_count") or 0),
         "shape": "dot",
-        "size": round(12 + min(28, 5.5 * math.log1p(paper_count)), 2),
-        "mass": round(1 + min(5, math.log1p(paper_count)), 2),
-        "color": _NODE_COLORS.get(str(node.get("entity_type")), "#78909C"),
-        "font": {"face": "Inter, Arial, sans-serif", "size": 14, "color": "#17324D"},
-        # Interaction nodes are filled circles without an outline.  Keep both
-        # normal and selected widths at zero so hover/selection does not add a ring.
-        "borderWidth": 0,
-        "borderWidthSelected": 0,
+        "size": round(
+            _scale_size(
+                sizing_paper_count,
+                max(1, min_paper_count),
+                max(1, max_paper_count),
+            ),
+            2,
+        ),
+        "color": {
+            "background": base_color,
+            "border": base_color,
+            "highlight": {"background": base_color, "border": base_color},
+            "hover": {"background": base_color, "border": base_color},
+        },
+        "font": {"face": "Helvetica", "size": 14, "color": "#111111"},
+        "borderWidth": 1,
+        "borderWidthSelected": 2,
     }
 
 
-def _edge_payload(edge: Mapping[str, Any]) -> dict[str, Any]:
+def _edge_payload(edge: Mapping[str, Any], node_sizes: Mapping[str, float]) -> dict[str, Any]:
     evidence_count = int(edge.get("evidence_count") or 0)
     paper_count = int(edge.get("paper_count") or 0)
     predicate = str(edge.get("predicate") or "relation")
     directed = predicate != "binding"
     color = _edge_color(predicate)
+    edge_length = int(
+        90
+        + 2.2
+        * (
+            float(node_sizes.get(str(edge["subject_id"]), 20.0))
+            + float(node_sizes.get(str(edge["object_id"]), 20.0))
+        )
+    )
     return {
         "id": str(edge["id"]),
         "from": str(edge["subject_id"]),
@@ -192,10 +233,11 @@ def _edge_payload(edge: Mapping[str, Any]) -> dict[str, Any]:
         "chunk_count": int(edge.get("chunk_count") or 0),
         "evidence_count": evidence_count,
         "context_evidence_count": int(edge.get("context_evidence_count") or 0),
-        "arrows": {"to": {"enabled": directed, "scaleFactor": 0.75}},
+        "arrows": {"to": {"enabled": directed, "scaleFactor": 0.35}},
         "color": {"color": color, "highlight": color, "hover": color, "opacity": 0.86},
-        "width": round(1.5 + min(7, 1.6 * math.log1p(paper_count)), 2),
-        "smooth": {"enabled": True, "type": "dynamic", "roundness": 0.22},
+        "width": 2.0,
+        "length": edge_length,
+        "smooth": {"enabled": True, "type": "dynamic"},
         "font": {
             "size": 11,
             "face": "Inter, Arial, sans-serif",
@@ -283,18 +325,31 @@ _GRAPH_OPTIONS: dict[str, Any] = {
         "enabled": True,
         "solver": "forceAtlas2Based",
         "forceAtlas2Based": {
-            "gravitationalConstant": -58,
+            "gravitationalConstant": -52,
             "centralGravity": 0.012,
-            "springLength": 125,
-            "springConstant": 0.055,
-            "damping": 0.5,
-            "avoidOverlap": 0.55,
+            "springLength": 170,
+            "springConstant": 0.05,
+            "damping": 0.45,
+            "avoidOverlap": 0.25,
         },
-        "stabilization": {"enabled": True, "iterations": 650, "updateInterval": 25},
-        "minVelocity": 0.75,
+        "maxVelocity": 2.8,
+        "minVelocity": 0.001,
+        "timestep": 0.14,
+        "adaptiveTimestep": True,
+        "stabilization": {"enabled": False},
     },
-    "nodes": {"chosen": True, "borderWidth": 0, "borderWidthSelected": 0},
-    "edges": {"chosen": True, "selectionWidth": 2},
+    "nodes": {
+        "shape": "dot",
+        "font": {"size": 14, "face": "Helvetica"},
+        "borderWidth": 1,
+        "borderWidthSelected": 2,
+    },
+    "edges": {
+        "smooth": {"type": "dynamic"},
+        "arrows": {"to": {"enabled": True, "scaleFactor": 0.35}},
+        "selectionWidth": 0,
+        "hoverWidth": 0,
+    },
 }
 
 
@@ -370,16 +425,25 @@ class NetworkRepository:
             height="100%",
             width="100%",
             directed=True,
-            bgcolor="#F7FAFC",
-            font_color="#17324D",
+            bgcolor="#FFFFFF",
+            font_color="#111111",
             cdn_resources="local",
         )
+        paper_counts = [max(1, int(node.get("paper_count") or 0)) for node in nodes] or [1]
+        min_paper_count = min(paper_counts)
+        max_paper_count = max(paper_counts)
+        node_sizes: dict[str, float] = {}
         for node in nodes:
-            payload = _node_payload(node)
+            payload = _node_payload(
+                node,
+                min_paper_count=min_paper_count,
+                max_paper_count=max_paper_count,
+            )
+            node_sizes[str(payload["id"])] = float(payload["size"])
             node_id = str(payload.pop("id"))
             net.add_node(node_id, **payload)
         for edge in edges:
-            payload = _edge_payload(edge)
+            payload = _edge_payload(edge, node_sizes)
             source = str(payload.pop("from"))
             target = str(payload.pop("to"))
             net.add_edge(source, target, **payload)
@@ -611,6 +675,64 @@ class NetworkRepository:
             {
                 "mode": "relation_types",
                 "selected_predicates": selected,
+                "relation_support_min": support_min,
+                "returned_node_count": len(nodes),
+                "returned_edge_count": len(edges),
+                "network_stats": stats,
+            }
+        )
+        return payload
+
+    def full_graph(
+        self,
+        job_id: str,
+        *,
+        relation_support_min: int = 1,
+    ) -> dict[str, Any]:
+        """Return every node and every supported edge for a full reset view."""
+
+        support_min = max(0, int(relation_support_min))
+        with self.connection(job_id) as connection:
+            edges = [
+                _row_dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT e.*, s.label AS subject_label, o.label AS object_label
+                    FROM edges e
+                    JOIN nodes s ON s.id = e.subject_id
+                    JOIN nodes o ON o.id = e.object_id
+                    WHERE e.paper_count >= ?
+                    ORDER BY e.paper_count DESC, e.evidence_count DESC, e.id
+                    """,
+                    (support_min,),
+                ).fetchall()
+            ]
+            nodes = [
+                _row_dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT n.*
+                    FROM nodes n
+                    WHERE EXISTS (
+                        SELECT 1 FROM edges e
+                        WHERE e.paper_count >= ?
+                          AND (e.subject_id = n.id OR e.object_id = n.id)
+                    )
+                    ORDER BY n.paper_count DESC, n.relation_count DESC,
+                             n.chunk_count DESC, n.label_norm, n.id
+                    """,
+                    (support_min,),
+                ).fetchall()
+            ]
+            meta_row = connection.execute(
+                "SELECT value FROM meta WHERE key = 'stats'"
+            ).fetchone()
+            stats = json.loads(meta_row["value"]) if meta_row else {}
+
+        payload = self._pyvis_payload(nodes, edges)
+        payload.update(
+            {
+                "mode": "full",
                 "relation_support_min": support_min,
                 "returned_node_count": len(nodes),
                 "returned_edge_count": len(edges),
@@ -898,16 +1020,32 @@ class NetworkRepository:
             ).fetchone()
             if node is None:
                 raise KeyError(node_id)
-            aliases = [
-                {"text": row["alias"], "count": row["count"]}
-                for row in connection.execute(
-                    """
-                    SELECT alias, count FROM node_aliases WHERE node_id = ?
-                    ORDER BY alias_kind DESC, count DESC, alias COLLATE NOCASE
-                    """,
-                    (node_id,),
-                ).fetchall()
-            ]
+            if self._table_exists(connection, "evidence_entities"):
+                aliases = [
+                    {"text": row["mention"], "count": row["count"]}
+                    for row in connection.execute(
+                        """
+                        SELECT mention, COUNT(*) AS count
+                        FROM evidence_entities
+                        WHERE node_id = ? AND TRIM(mention) <> ''
+                        GROUP BY mention COLLATE NOCASE
+                        ORDER BY count DESC, mention COLLATE NOCASE
+                        """,
+                        (node_id,),
+                    ).fetchall()
+                ]
+            else:
+                aliases = [
+                    {"text": row["alias"], "count": row["count"]}
+                    for row in connection.execute(
+                        """
+                        SELECT alias, count FROM node_aliases
+                        WHERE node_id = ? AND alias_kind > 0
+                        ORDER BY alias_kind DESC, count DESC, alias COLLATE NOCASE
+                        """,
+                        (node_id,),
+                    ).fetchall()
+                ]
             predicates = [
                 _row_dict(row)
                 for row in connection.execute(
