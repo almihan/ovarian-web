@@ -41,6 +41,31 @@ logger = logging.getLogger(__name__)
 _ONE_MIB = 1024 * 1024
 
 
+def _silence_model_output() -> None:
+    """Disable model progress bars and non-error library output."""
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    for name in ("transformers", "huggingface_hub", "sentence_transformers"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    try:
+        from transformers.utils import logging as transformers_logging
+
+        transformers_logging.set_verbosity_error()
+        transformers_logging.disable_progress_bar()
+    except Exception:
+        pass
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+
+        disable_progress_bars()
+    except Exception:
+        pass
+
+
 def _resource_version(path: Path) -> str:
     return f"{path.stem}-{hashlib.sha256(path.read_bytes()).hexdigest()[:12]}"
 
@@ -256,6 +281,7 @@ def run_annotation_bundle(
     when CUDA is unavailable.
     """
 
+    _silence_model_output()
     started = time.monotonic()
     callback = (
         payload.get("callback")
@@ -604,7 +630,7 @@ def run_annotation_bundle(
             }
     except Exception as exc:
         elapsed = round(time.monotonic() - started, 2)
-        logger.exception("Cell annotation branch %s failed", job_id)
+        logger.error("Cell annotation branch %s failed: %s", job_id, exc)
         _post_callback(
             callback,
             {

@@ -1,10 +1,8 @@
-"""Resumable online Responses API executor for Stage 3 relation extraction.
+"""Bounded online Responses API executor for Stage 3 relation extraction.
 
-The FastAPI process keeps one bounded source window in memory (500 chunks by
- default) and runs only a small configurable number of OpenAI Responses API
-calls concurrently. Each request result is appended to a durable local journal
-before it is counted, allowing local or Railway restarts to resume unfinished
-chunks without an offline completion window.
+The existing relation logic keeps one small source window in memory and writes
+temporary local checkpoints before publishing the final compressed artifact.
+Those checkpoints are run-only data and are cleared when the application starts.
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import requests
 
 from backend.config import settings
-from backend.database.database import (
+from backend.worker_state import (
     get_relation_job,
     list_relation_jobs,
     update_relation_job,
@@ -516,7 +514,7 @@ class _EventJournal:
 
 
 class RelationExecutor:
-    """One bounded, resumable Stage 3 worker per web process."""
+    """One bounded Stage 3 worker per web process."""
 
     def __init__(self) -> None:
         self._pool = ThreadPoolExecutor(

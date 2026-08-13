@@ -43,10 +43,19 @@ def relation_artifact_keys(
     source_chunks_sha256: str,
     model_signature: str,
 ) -> RelationArtifactKeys:
-    root = (
-        f"relations/{source_annotation_sha256[:2]}/{source_annotation_sha256}/"
-        f"{source_chunks_sha256[:16]}/{model_signature[:20]}"
-    )
+    signature_parts = model_signature.split("-", 2)
+    if (
+        len(signature_parts) == 3
+        and signature_parts[0] == "run"
+        and len(signature_parts[1]) == 32
+        and all(character in "0123456789abcdef" for character in signature_parts[1])
+    ):
+        root = f"runs/{signature_parts[1]}/stage3"
+    else:
+        root = (
+            f"relations/{source_annotation_sha256[:2]}/{source_annotation_sha256}/"
+            f"{source_chunks_sha256[:16]}/{model_signature[:20]}"
+        )
     return RelationArtifactKeys(
         relations=prefixed_key(f"{root}/relations.jsonl.gz"),
         summary=prefixed_key(f"{root}/summary.json"),

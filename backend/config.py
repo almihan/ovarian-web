@@ -67,14 +67,11 @@ class Settings:
     public_base_url: str
 
     data_dir: Path
-    database_path: Path
-    papers_dir: Path
-    results_dir: Path
     artifact_local_dir: Path
     cell_model_cache_dir: Path
     local_annotation_jobs_dir: Path
     relation_jobs_dir: Path
-    network_jobs_dir: Path
+    run_retention_seconds: int
 
     artifact_backend: str
     artifact_bucket: str
@@ -103,8 +100,6 @@ class Settings:
     modal_app_name: str
     modal_function_name: str
     modal_environment: str | None
-    modal_status_stale_seconds: int
-
     cell_ner_model: str
     cell_ner_revision: str | None
     cell_nen_model: str
@@ -143,14 +138,10 @@ class Settings:
     def ensure_directories(self) -> None:
         for directory in (
             self.data_dir,
-            self.papers_dir,
-            self.results_dir,
             self.artifact_local_dir,
             self.cell_model_cache_dir,
             self.local_annotation_jobs_dir,
             self.relation_jobs_dir,
-            self.network_jobs_dir,
-            self.database_path.parent,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -163,21 +154,6 @@ class Settings:
             and os.getenv("MODAL_TOKEN_ID")
             and os.getenv("MODAL_TOKEN_SECRET")
         )
-
-    @property
-    def local_annotation_configured(self) -> bool:
-        return bool(
-            self.cell_annotation_backend == "local"
-            and self.artifact_backend == "local"
-        )
-
-    @property
-    def annotation_configured(self) -> bool:
-        if self.cell_annotation_backend == "local":
-            return self.local_annotation_configured
-        if self.cell_annotation_backend == "modal":
-            return self.modal_configured and self.artifact_backend == "s3"
-        return False
 
     @property
     def relation_configured(self) -> bool:
@@ -227,15 +203,6 @@ def get_settings() -> Settings:
         environment=os.getenv("APP_ENV", "development"),
         public_base_url=_public_base_url(),
         data_dir=data_dir,
-        database_path=Path(
-            os.getenv("DATABASE_PATH", str(data_dir / "database.sqlite"))
-        ).expanduser().resolve(),
-        papers_dir=Path(
-            os.getenv("PAPERS_DIR", str(data_dir / "papers"))
-        ).expanduser().resolve(),
-        results_dir=Path(
-            os.getenv("RESULTS_DIR", str(data_dir / "results"))
-        ).expanduser().resolve(),
         artifact_local_dir=Path(
             os.getenv("ARTIFACT_LOCAL_DIR", str(data_dir / "artifacts"))
         ).expanduser().resolve(),
@@ -254,12 +221,12 @@ def get_settings() -> Settings:
                 str(data_dir / "relation_jobs"),
             )
         ).expanduser().resolve(),
-        network_jobs_dir=Path(
-            os.getenv(
-                "NETWORK_JOBS_DIR",
-                str(data_dir / "network_jobs"),
-            )
-        ).expanduser().resolve(),
+        run_retention_seconds=_as_int(
+            os.getenv("RUN_RETENTION_SECONDS"),
+            default=21_600,
+            minimum=3_600,
+            maximum=86_400,
+        ),
         artifact_backend=artifact_backend,
         artifact_bucket=bucket,
         artifact_endpoint=endpoint,
@@ -340,12 +307,6 @@ def get_settings() -> Settings:
             or "annotate_bundle"
         ),
         modal_environment=(os.getenv("MODAL_ENVIRONMENT") or "").strip() or None,
-        modal_status_stale_seconds=_as_int(
-            os.getenv("MODAL_STATUS_STALE_SECONDS"),
-            default=25,
-            minimum=5,
-            maximum=300,
-        ),
         cell_ner_model=(
             os.getenv("CELL_NER_MODEL", "almire/CellExLink-bioformer16L").strip()
             or "almire/CellExLink-bioformer16L"

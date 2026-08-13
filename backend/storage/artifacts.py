@@ -16,6 +16,7 @@ import shutil
 import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Mapping
 
@@ -130,6 +131,11 @@ class ArtifactStore(ABC):
 
     @abstractmethod
     def delete(self, key: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_prefix(self, prefix: str) -> int:
+        """Delete every artifact below a temporary namespace."""
         raise NotImplementedError
 
 
@@ -280,6 +286,18 @@ class LocalArtifactStore(ArtifactStore):
         path = self._path(key)
         path.unlink(missing_ok=True)
         self._metadata_path(path).unlink(missing_ok=True)
+
+    def delete_prefix(self, prefix: str) -> int:
+        clean_prefix = _clean_key(prefix).rstrip("/")
+        root = self._path(clean_prefix)
+        if root.is_file():
+            self.delete(clean_prefix)
+            return 1
+        if not root.exists():
+            return 0
+        count = sum(1 for path in root.rglob("*") if path.is_file() and not path.name.endswith(".metadata.json"))
+        shutil.rmtree(root, ignore_errors=True)
+        return count
 
 
 class S3ArtifactStore(ArtifactStore):
@@ -439,7 +457,30 @@ class S3ArtifactStore(ArtifactStore):
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=_clean_key(key))
 
+    def delete_prefix(self, prefix: str) -> int:
+        clean_prefix = _clean_key(prefix).rstrip("/") + "/"
+        deleted = 0
+        while True:
+            response = self.client.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix=clean_prefix,
+                MaxKeys=1000,
+            )
+            objects = [
+                {"Key": item["Key"]}
+                for item in response.get("Contents", [])
+                if item.get("Key")
+            ]
+            if not objects:
+                return deleted
+            self.client.delete_objects(
+                Bucket=self.bucket,
+                Delete={"Objects": objects, "Quiet": True},
+            )
+            deleted += len(objects)
 
+
+@lru_cache(maxsize=1)
 def get_artifact_store() -> ArtifactStore:
     if settings.artifact_backend == "s3":
         return S3ArtifactStore()

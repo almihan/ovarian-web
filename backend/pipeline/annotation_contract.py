@@ -62,10 +62,22 @@ def annotation_model_signature() -> str:
 def annotation_artifact_keys(
     *, source_sha256: str, model_signature: str
 ) -> AnnotationArtifactKeys:
-    root = (
-        f"annotations/{source_sha256[:2]}/{source_sha256}/"
-        f"{model_signature[:20]}"
-    )
+    # Run-scoped signatures are intentionally non-reusable.  Their artifacts
+    # live below one temporary namespace that is removed when the web process
+    # starts or shuts down.  Plain hash signatures are the shared default cache.
+    signature_parts = model_signature.split("-", 2)
+    if (
+        len(signature_parts) == 3
+        and signature_parts[0] == "run"
+        and len(signature_parts[1]) == 32
+        and all(character in "0123456789abcdef" for character in signature_parts[1])
+    ):
+        root = f"runs/{signature_parts[1]}/stage2"
+    else:
+        root = (
+            f"annotations/{source_sha256[:2]}/{source_sha256}/"
+            f"{model_signature[:20]}"
+        )
     return AnnotationArtifactKeys(
         final_annotations=prefixed_key(f"{root}/entity_annotations.jsonl.gz"),
         final_summary=prefixed_key(f"{root}/summary.json"),

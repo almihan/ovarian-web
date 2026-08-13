@@ -108,7 +108,7 @@
                             <div class="stage-panel-main">
                                 <div class="stage-panel-heading">
                                     <span class="stage-panel-icon retrieval"><svg class="icon"><use href="#icon-search"></use></svg></span>
-                                    <div><span>Stage 1 of 4</span><h3>Retrieve papers</h3><p>Search the ovarian-literature corpus, collect metadata and available full text, and create reusable text chunks for the downstream stages.</p></div>
+                                    <div><span>Stage 1 of 4</span><h3>Retrieve papers</h3><p>Reuse the shared default ovarian corpus, retrieve only papers added by this page's optional search, and create aligned chunks for downstream stages.</p></div>
                                 </div>
                                 <form id="analysisForm" class="pipeline-search-form" novalidate>
                                     <div class="search-label-row">
@@ -118,11 +118,11 @@
                                         <svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg>
                                         <input id="queryInput" name="query" type="text" maxlength="4000" placeholder="macrophage, granulosa cells, not cancer, PMID:12345678, PMC1234567" autocomplete="off">
                                     </div>
-                                    <p class="field-help">Separate keywords, exclusions, PMIDs, and PMCIDs with commas. Press Enter or use the Stage 1 button to begin.</p>
+                                    <p class="field-help">The built-in default query is always included. Separate optional keywords, exclusions, PMIDs, and PMCIDs with commas. Custom additions are recomputed only for this page run.</p>
                                     <p class="form-error" id="formError" role="alert" hidden></p>
                                 </form>
                                 <div class="stage-action-row">
-                                    <div class="stage-readiness" id="retrievalReadiness" data-state="ready"><i></i><div><strong id="retrievalReadinessTitle">Ready to retrieve</strong><span id="retrievalReadinessText">Your optional search additions are used for this retrieval.</span></div></div>
+                                    <div class="stage-readiness" id="retrievalReadiness" data-state="ready"><i></i><div><strong id="retrievalReadinessTitle">Ready to retrieve</strong><span id="retrievalReadinessText">Shared defaults are reused; optional additions are isolated to this page run.</span></div></div>
                                     <button class="button button-primary" id="startAnalysis" form="analysisForm" type="submit"><svg class="icon"><use href="#icon-play"></use></svg><span>Start retrieval</span></button>
                                 </div>
                             </div>
@@ -130,7 +130,7 @@
                                 <div class="progress-card ready" id="retrievalProgressCard">
                                     <div class="progress-top"><div><span>Current status</span><strong class="progress-stage" id="retrievalProgressStage">Ready</strong></div><strong class="progress-percent" id="retrievalProgressPercent">0%</strong></div>
                                     <div class="progress-track" id="retrievalProgressTrack" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="retrievalProgressBar"></span></div>
-                                    <p id="retrievalProgressMessage">Start Stage 1 to create a reusable chunk artifact.</p>
+                                    <p id="retrievalProgressMessage">Start Stage 1 to load shared defaults and retrieve any custom additions.</p>
                                 </div>
                             </aside>
                             <section class="completion-card retrieval-completion-card" id="retrievalSummary" aria-live="polite" hidden>
@@ -208,9 +208,9 @@
                             <div class="stage-panel-main">
                                 <div class="stage-panel-heading">
                                     <span class="stage-panel-icon network"><svg class="icon"><use href="#icon-network"></use></svg></span>
-                                    <div><span>Stage 4 of 4</span><h3>Build and explore the interaction network</h3><p>Convert normalized entities and validated relations into a searchable evidence-linked network, with binding displayed without direction.</p></div>
+                                    <div><span>Stage 4 of 4</span><h3>Build and explore the interaction network</h3><p>Build a temporary searchable evidence-linked network for this page run, with binding displayed without direction. Stage 4 is not saved in shared storage.</p></div>
                                 </div>
-                                <div class="stage-tags" aria-label="Network outputs"><span>Searchable graph</span><span>Evidence explorer</span><span>Downloadable index</span></div>
+                                <div class="stage-tags" aria-label="Network outputs"><span>Searchable graph</span><span>Evidence explorer</span><span>Temporary index</span></div>
                                 <form id="networkForm" class="stage-action-form" novalidate>
                                     <div class="stage-action-row">
                                         <div class="stage-readiness" id="networkReadiness" data-state="locked"><i></i><div><strong id="networkReadinessTitle">Waiting for Stage 3</strong><span id="networkReadinessText">Complete relation extraction to unlock network generation.</span></div></div>
@@ -242,6 +242,6 @@
 
     <footer class="site-footer"><div class="container"><div><strong>Ovarian Network <span>v1.0</span></strong><p>Controlled literature retrieval, entity extraction, relation extraction, and interaction-network exploration.</p><p>Automated annotations and relations may contain errors; review source text for high-stakes use.</p></div><p class="footer-community">Made with <span aria-hidden="true">♥</span> for the research community</p></div></footer>
     <div class="toast" id="toast" hidden role="status"><svg class="icon"><use href="#icon-check"></use></svg><span id="toastMessage">Updated.</span></div>
-    <script src="/static/js/app.js?v=20260811-workflow-reset-2" defer></script>
+    <script src="/static/js/app.js?v=20260812-ephemeral-runs-1" defer></script>
 </body>
 </html>

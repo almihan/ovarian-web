@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -61,7 +62,6 @@ class LocalAnnotationExecutor:
         job_dir.mkdir(parents=True, exist_ok=True)
         payload_path = job_dir / "payload.json"
         result_path = job_dir / "result.json"
-        log_path = job_dir / "worker.log"
         result_path.unlink(missing_ok=True)
 
         worker_payload = dict(payload)
@@ -76,6 +76,10 @@ class LocalAnnotationExecutor:
 
         environment = os.environ.copy()
         environment.setdefault("TOKENIZERS_PARALLELISM", "false")
+        environment.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        environment.setdefault("HF_HUB_VERBOSITY", "error")
+        environment.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        environment.setdefault("TQDM_DISABLE", "1")
         environment.setdefault("PYTHONUNBUFFERED", "1")
         local_no_proxy = "127.0.0.1,localhost"
         environment["NO_PROXY"] = ",".join(
@@ -85,7 +89,7 @@ class LocalAnnotationExecutor:
         )
         environment["no_proxy"] = environment["NO_PROXY"]
         if settings.cell_local_device == "cpu":
-            # Make the local test deterministic even on a workstation that has
+            # Keep a local CPU run deterministic even on a workstation that has
             # CUDA. Set CELL_LOCAL_DEVICE=auto later to allow local GPU use.
             environment["CUDA_VISIBLE_DEVICES"] = ""
 
@@ -101,14 +105,18 @@ class LocalAnnotationExecutor:
         else:
             popen_kwargs["start_new_session"] = True
 
-        with log_path.open("ab", buffering=0) as log_handle:
-            process = subprocess.Popen(
-                [sys.executable, "-m", "backend.local_worker", str(payload_path)],
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                **popen_kwargs,
-            )
+        process = subprocess.Popen(
+            [sys.executable, "-m", "backend.local_worker", str(payload_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **popen_kwargs,
+        )
         return f"{job_id}:{process.pid}"
+
+    def cleanup(self, job_id: str) -> None:
+        """Remove one finished local worker's small control directory."""
+
+        shutil.rmtree(self._job_dir(job_id), ignore_errors=True)
 
     def poll(self, call_id: str) -> LocalPollResult:
         raw = str(call_id or "")

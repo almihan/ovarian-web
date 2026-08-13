@@ -23,6 +23,10 @@ download_image = (
         {
             "HF_HOME": "/model-cache/huggingface",
             "HF_HUB_DISABLE_TELEMETRY": "1",
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+            "HF_HUB_VERBOSITY": "error",
+            "TRANSFORMERS_VERBOSITY": "error",
+            "TQDM_DISABLE": "1",
             "HF_XET_HIGH_PERFORMANCE": "1",
             "PYTHONUNBUFFERED": "1",
         }
@@ -45,6 +49,10 @@ worker_image = (
         {
             "HF_HOME": "/model-cache/huggingface",
             "HF_HUB_DISABLE_TELEMETRY": "1",
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+            "HF_HUB_VERBOSITY": "error",
+            "TRANSFORMERS_VERBOSITY": "error",
+            "TQDM_DISABLE": "1",
             "HF_XET_HIGH_PERFORMANCE": "1",
             "TOKENIZERS_PARALLELISM": "false",
             "PYTHONUNBUFFERED": "1",

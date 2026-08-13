@@ -2,22 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
 import html
 import json
 import math
-import os
 import sqlite3
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-import requests
 
 from backend.config import settings
-from backend.database.database import get_network_job
-from backend.pipeline.entity_artifacts import sha256_path
+from backend.runtime import run_registry
 from backend.services.cell_hierarchy import (
     CellHierarchyError,
     CellHierarchyTermNotFound,
@@ -25,7 +20,6 @@ from backend.services.cell_hierarchy import (
     normalize_cl_id,
     ontology_node_id,
 )
-from backend.storage.artifacts import get_artifact_store
 
 _NODE_COLORS = {
     "cell": {
@@ -305,62 +299,10 @@ _GRAPH_OPTIONS: dict[str, Any] = {
 
 
 class NetworkRepository:
-    def __init__(self) -> None:
-        self._cache_dir = settings.network_jobs_dir / "graph_cache"
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-
-    def _graph_path(self, job_id: str) -> Path:
-        job = get_network_job(job_id)
-        if job is None:
-            raise FileNotFoundError("Network job not found.")
-        if job.get("status") != "completed":
-            raise RuntimeError("The network is not ready yet.")
-        key = str(job.get("graph_artifact_key") or "")
-        if not key:
-            raise FileNotFoundError("The SQLite network artifact is missing.")
-        store = get_artifact_store()
-        local = store.local_path(key)
-        if local is not None:
-            return local
-
-        stats = job.get("stats")
-        expected_sha256 = (
-            str(stats.get("graph_artifact_sha256") or "")
-            if isinstance(stats, Mapping)
-            else ""
-        )
-        if not expected_sha256:
-            ref = store.head(key)
-            if ref is None:
-                raise FileNotFoundError("The SQLite network artifact is missing.")
-            expected_sha256 = ref.sha256
-        digest = expected_sha256 or hashlib.sha256(key.encode("utf-8")).hexdigest()
-        destination = self._cache_dir / f"{digest}.sqlite"
-        with self._lock:
-            if destination.is_file() and (
-                not expected_sha256
-                or sha256_path(destination) == expected_sha256
-            ):
-                return destination
-            temporary = destination.with_suffix(".tmp")
-            temporary.unlink(missing_ok=True)
-            url = store.presign_get(
-                key, expires_seconds=settings.artifact_presigned_ttl_seconds
-            )
-            with requests.get(url, stream=True, timeout=(20, 900)) as response:
-                response.raise_for_status()
-                with temporary.open("wb") as output:
-                    for block in response.iter_content(chunk_size=_ONE_MIB):
-                        if block:
-                            output.write(block)
-                    output.flush()
-                    os.fsync(output.fileno())
-            if expected_sha256 and sha256_path(temporary) != expected_sha256:
-                temporary.unlink(missing_ok=True)
-                raise ValueError("The cached network artifact failed its SHA-256 check.")
-            os.replace(temporary, destination)
-        return destination
+    def _graph_path(self, run_id: str) -> Path:
+        # Stage 4 is intentionally ephemeral. The graph exists only inside this
+        # process's private run directory and is never uploaded to shared storage.
+        return run_registry.graph_path(run_id)
 
     @contextmanager
     def connection(self, job_id: str) -> Iterator[sqlite3.Connection]:

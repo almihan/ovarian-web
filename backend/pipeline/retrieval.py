@@ -3083,6 +3083,9 @@ def run_paper_retrieval(
     batch_size: int = 200,
     request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
     progress_callback: ProgressCallback | None = None,
+    exclude_pmids: Sequence[str] = (),
+    exclude_pmcids: Sequence[str] = (),
+    exclude_canonical_ids: Sequence[str] = (),
 ) -> RetrievalResult:
     """Retrieve papers while reusing metadata, full text, and chunk caches.
 
@@ -3104,6 +3107,19 @@ def run_paper_retrieval(
     effective_query = build_augmented_pubmed_query(
         effective.user_keywords, effective.user_exclusions
     )
+    excluded_pmids = {
+        normalized
+        for value in exclude_pmids
+        if (normalized := normalize_pmid(value))
+    }
+    excluded_pmcids = {
+        normalized
+        for value in exclude_pmcids
+        if (normalized := normalize_pmcid(value))
+    }
+    excluded_canonical_ids = {
+        clean_text(value) for value in exclude_canonical_ids if clean_text(value)
+    }
     reporter = ProgressReporter(progress_callback)
     metadata_timeout = max(5, min(int(request_timeout), MAX_REQUEST_TIMEOUT))
 
@@ -3179,6 +3195,10 @@ def run_paper_retrieval(
         "keyword_query_duplicate_ignored": effective.user_keyword_was_redundant,
         "new_paper_count": 0,
         "existing_paper_count": 0,
+        "baseline_excluded_pmid_count": len(excluded_pmids),
+        "baseline_excluded_pmcid_count": len(excluded_pmcids),
+        "baseline_excluded_canonical_count": len(excluded_canonical_ids),
+        "baseline_papers_removed_from_run": 0,
         "elapsed_seconds": 0.0,
     }
 
@@ -3211,15 +3231,28 @@ def run_paper_retrieval(
             job_ids.append(canonical_id)
 
     def include(record: dict[str, Any], *, metadata_downloaded: bool = False) -> str:
+        normalized_record = normalize_record(record)
+        candidate_id = CorpusStore.new_canonical_id(normalized_record)
+        if (
+            normalized_record.get("pmid") in excluded_pmids
+            or normalized_record.get("pmcid") in excluded_pmcids
+            or candidate_id in excluded_canonical_ids
+        ):
+            stats["baseline_papers_removed_from_run"] = int(
+                stats.get("baseline_papers_removed_from_run") or 0
+            ) + 1
+            return ""
         canonical_id, is_new = store.add_if_new(
-            record,
+            normalized_record,
             prefer_existing_ids=initial_canonical_ids,
         )
+        if canonical_id in excluded_canonical_ids:
+            return ""
         add_job_id(canonical_id)
-        if metadata_downloaded:
+        if metadata_downloaded and canonical_id:
             metadata_downloaded_ids.add(canonical_id)
             metadata_reused_ids.discard(canonical_id)
-        elif not is_new:
+        elif not is_new and canonical_id:
             metadata_reused_ids.add(canonical_id)
         return canonical_id
 
@@ -3259,7 +3292,14 @@ def run_paper_retrieval(
         stats["search_total_hits"] = search_total
         stats["search_selected"] = len(search_ids)
 
-        selected_pmids = unique_preserving_order((*effective.pmids, *search_ids))
+        selected_pmids = unique_preserving_order(
+            pmid
+            for pmid in (*effective.pmids, *search_ids)
+            if pmid not in excluded_pmids
+        )
+        selected_pmcids = unique_preserving_order(
+            pmcid for pmcid in effective.pmcids if pmcid not in excluded_pmcids
+        )
         pmids_to_fetch: list[str] = []
         for pmid in selected_pmids:
             cached_id = store.id_index.get(f"pmid:{pmid}")
@@ -3329,7 +3369,7 @@ def run_paper_retrieval(
                 )
 
         unresolved_pmcids: list[str] = []
-        for pmcid in effective.pmcids:
+        for pmcid in selected_pmcids:
             cached_id = store.id_index.get(f"pmcid:{pmcid}")
             cached_record = store.get(cached_id) if cached_id else None
             if cached_id and _record_has_metadata(cached_record):
@@ -3356,7 +3396,7 @@ def run_paper_retrieval(
                     include(record, metadata_downloaded=True)
 
         # Preserve explicit PMCIDs even when Europe PMC returns no metadata.
-        for pmcid in effective.pmcids:
+        for pmcid in selected_pmcids:
             cached_id = store.id_index.get(f"pmcid:{pmcid}")
             if cached_id:
                 add_job_id(cached_id)
@@ -3677,6 +3717,9 @@ def run_paper_retrieval(
                 "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
                 "fulltext_negative_cache_days": FULLTEXT_NEGATIVE_CACHE_DAYS,
                 "fulltext_storage": "compact_bioc_json_gzip",
+                "baseline_filter_enabled": bool(
+                    excluded_pmids or excluded_pmcids or excluded_canonical_ids
+                ),
             },
             "stats": stats,
             "files": {

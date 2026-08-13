@@ -6,7 +6,6 @@ import json
 import os
 import sys
 import tempfile
-import traceback
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -32,7 +31,6 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) != 1:
-        print("Usage: python -m backend.local_worker /path/to/payload.json", file=sys.stderr)
         return 2
 
     payload_path = Path(args[0]).expanduser().resolve()
@@ -63,13 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         _write_json_atomic(
             result_path,
-            {
-                "state": "failed",
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            },
+            {"state": "failed", "error": str(exc)},
         )
-        traceback.print_exc()
         return 1
     finally:
         # The payload contains a short-lived callback token. It is unnecessary

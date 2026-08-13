@@ -23,7 +23,7 @@ from typing import Any, Mapping
 import requests
 
 from backend.config import settings
-from backend.database.database import (
+from backend.worker_state import (
     get_annotation_job,
     list_annotation_jobs,
     update_annotation_job,
@@ -821,6 +821,11 @@ class RailwayAnnotationExecutor:
                 stats={"merge_status": "failed"},
             )
             raise
+
+    def shutdown(self) -> None:
+        """Stop accepting new temporary Stage 2 coordination work."""
+
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 railway_annotation_executor = RailwayAnnotationExecutor()
