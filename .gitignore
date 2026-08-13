@@ -60,6 +60,15 @@ data/papers/*
 data/results/*
 !data/results/.gitkeep
 
+data/artifacts/*
+!data/artifacts/.gitkeep
+
+data/relation_jobs/*
+!data/relation_jobs/.gitkeep
+
+data/local_annotation_jobs/*
+!data/local_annotation_jobs/.gitkeep
+
 data/model_cache/*
 !data/model_cache/.gitkeep
 
