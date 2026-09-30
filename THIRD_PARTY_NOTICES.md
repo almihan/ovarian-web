@@ -29,12 +29,8 @@ This application accesses NCBI/NLM services, including PubMed, PubMed Central,
 PubTator3, NCBI Gene, MeSH, and the Entrez Programming Utilities (E-utilities).
 Those services and their data are not bundled with or licensed by this project.
 Their use remains subject to the applicable NCBI/NLM policies, disclaimers, and
-the rights attached to the underlying literature. In particular, PubMed
-abstracts and PMC articles may contain copyrighted material.
+the rights attached to the underlying literature. 
 
-PubTator3 entity annotations are produced automatically and can contain missed
-or incorrect mentions, identifiers, or boundaries. The output should be
-reviewed before use in clinical, regulatory, or other high-stakes decisions.
 
 PubTator3 reference: Chih-Hsuan Wei et al., “PubTator 3.0: an AI-powered
 literature resource for unlocking biomedical knowledge,” *Nucleic Acids
@@ -64,11 +60,8 @@ release used by a run is available in the Stage 2 statistics and in
 
 ## Cell Ontology hierarchy resource
 
-The Stage 4 explorer bundles a compact transformation of Cell Ontology release
-`2025-12-17`. The retained fields are ontology identifiers, labels, synonyms,
-definitions, alternate identifiers, and direct `is_a` parent relationships. The
-compressed resource is used only for on-demand hierarchy display and does not
-replace the original ontology. Cell Ontology is distributed under the Creative
+The
+compressed resource is used only for on-demand hierarchy display. Cell Ontology is distributed under the Creative
 Commons Attribution 4.0 International license (CC BY 4.0).
 
 Source project: https://github.com/obophenotype/cell-ontology
