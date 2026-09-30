@@ -1,8 +1,8 @@
 """Ephemeral Stage 4 exploration API.
 
-Stage 4 graph files are deliberately local to one in-memory browser run. They
-are never uploaded to shared storage and cannot be recovered after a reload or
-application restart.
+Stage 4 graph files are deliberately local to one temporary in-process run.
+They are never uploaded to shared storage. Back/Home navigation can reopen the
+same run while the FastAPI process retains it; application restart removes it.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from backend.config import settings
@@ -20,8 +20,27 @@ from backend.services.network_repository import (
     CellHierarchyTermNotFound,
     network_repository,
 )
+from backend.services.xlsx_export import _XLSX_MIME, build_displayed_network_xlsx
 
 router = APIRouter(prefix="/api/networks", tags=["networks"])
+
+
+class DisplayedNetworkExportRequest(BaseModel):
+    edge_ids: list[str] = Field(min_length=1, max_length=200000)
+
+    @field_validator("edge_ids")
+    @classmethod
+    def clean_edge_ids(cls, values: list[str]) -> list[str]:
+        cleaned = list(
+            dict.fromkeys(
+                " ".join(str(value or "").split())
+                for value in values
+                if " ".join(str(value or "").split())
+            )
+        )
+        if not cleaned:
+            raise ValueError("At least one displayed interaction edge is required.")
+        return cleaned
 
 
 class CellHierarchyRequest(BaseModel):
@@ -44,6 +63,8 @@ class CellHierarchyRequest(BaseModel):
 
 
 def _public_job(run_id: str) -> dict[str, Any]:
+    if run_registry.get_private(run_id, "trusted_update", False):
+        raise HTTPException(status_code=404, detail="Run not found.")
     try:
         run = run_registry.public(run_id)
     except KeyError as exc:
@@ -173,6 +194,24 @@ def relation_types(
     }
 
 
+@router.get("/{job_id}/graph/closed")
+def closed_loop_graph(
+    job_id: str,
+    relation_support_min: int = Query(default=1, ge=0),
+) -> dict[str, Any]:
+    """Return all loop-supported components and remove open/bridge links."""
+
+    _ready_job(job_id)
+    try:
+        return network_repository.closed_loop_graph(
+            job_id,
+            relation_support_min=relation_support_min,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+
 @router.get("/{job_id}/graph/full")
 def full_graph(
     job_id: str,
@@ -210,6 +249,38 @@ def relation_type_graph(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/{job_id}/export/displayed-network")
+def export_displayed_network(
+    job_id: str,
+    payload: DisplayedNetworkExportRequest,
+) -> Response:
+    """Download the currently displayed interaction network as a plain XLSX."""
+
+    _ready_job(job_id)
+    try:
+        rows = network_repository.displayed_network_rows(job_id, payload.edge_ids)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not rows:
+        raise HTTPException(
+            status_code=422,
+            detail="No displayed interaction relations were available to save.",
+        )
+    try:
+        workbook = build_displayed_network_xlsx(rows)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return Response(
+        content=workbook,
+        media_type=_XLSX_MIME,
+        headers={
+            "Content-Disposition": 'attachment; filename="displayed-network.xlsx"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get("/{job_id}/cell-hierarchy")

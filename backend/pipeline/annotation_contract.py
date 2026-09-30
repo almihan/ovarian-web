@@ -1,4 +1,4 @@
-"""Shared contract for Railway orchestration and Modal cell annotation."""
+"""Shared contract for local Stage 2 entity extraction."""
 
 from __future__ import annotations
 
@@ -9,15 +9,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from backend.cellexlink_lite.normalization import cell_min_cosine
 from backend.cellexlink_lite.resources import (
     DEFAULT_ABBREVIATIONS_PATH,
     DEFAULT_ONTOLOGY_PATH,
 )
 from backend.config import settings
+from backend.pipeline.entity_lexicons import (
+    DEFAULT_HORMONE_LEXICON_PATH,
+    MESH_HORMONE_RESOURCE_VERSION,
+)
+from backend.pipeline.entity_overlap import ENTITY_OVERLAP_POLICY
 from backend.pipeline.pubtator3_annotation_worker import PUBTATOR3_PIPELINE_VERSION
 from backend.storage.artifacts import ArtifactRef, prefixed_key
 
-ANNOTATION_PIPELINE_VERSION = "entity-extraction-parallel-v6-ncbi-human-genes"
+from backend.pipeline.receptor_annotations import RECEPTOR_POLICY
+from backend.pipeline.document_repeat_recovery import RECOVERY_VERSION
+
+ANNOTATION_PIPELINE_VERSION = "entity-extraction-same-paper-longest-cell-recovery-v10"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,14 +50,38 @@ def _sha256_path(path: Path) -> str:
 def annotation_model_signature() -> str:
     payload = {
         "pipeline_version": ANNOTATION_PIPELINE_VERSION,
-        "execution_layout": "modal-cellexlink-plus-railway-pubtator3",
+        "execution_layout": (
+            "pre-ner-ab3p-all-entities-exact-recovery-plus-gated-cell-linking-"
+            "plus-pubtator3-hgnc-only"
+        ),
         "ner_model": settings.cell_ner_model,
         "ner_revision": settings.cell_ner_revision,
         "nen_model": settings.cell_nen_model,
         "nen_revision": settings.cell_nen_revision,
         "ontology_sha256": _sha256_path(DEFAULT_ONTOLOGY_PATH),
         "abbreviations_sha256": _sha256_path(DEFAULT_ABBREVIATIONS_PATH),
+        "mesh_hormone_resource_version": MESH_HORMONE_RESOURCE_VERSION,
+        "mesh_hormone_bundle_sha256": _sha256_path(DEFAULT_HORMONE_LEXICON_PATH),
         "abbreviations_enabled": not settings.cell_disable_abbreviations,
+        "cell_vector_policy": "boundary-safe-exact-alias-or-thresholded-top1",
+        "cell_static_policy": "word-boundaries-acronym-case-resource-provenance-v1",
+        "cell_coordination_policy": "ontology-shared-head-modifiers-v1",
+        "cell_vector_min_cosine": cell_min_cosine(),
+        "entity_overlap_policy": ENTITY_OVERLAP_POLICY,
+        "ab3p_entity_types": ["cell", "hormone", "gene"],
+        "ab3p_gene_enabled": True,
+        "gene_group_normalization": False,
+        "abbreviation_identity_policy": "approved-symbol-protected-marker-safe-v1",
+        "gene_surface_policy": "word-boundary-case-and-list-safe-v4",
+        "gene_exact_recovery": "every-eligible-chunk-before-ner-plus-pubtator",
+        "cell_context_policy": "ontology-shared-head-and-boundary-safe-cell-phrase-v7",
+        "document_repeat_recovery": RECOVERY_VERSION,
+        "cell_surface_rescue": "paper-wide-candidates-defer-overlaps-v2",
+        "gene_identity_policy": "hgnc-required-no-species-validation",
+        "receptor_policy": RECEPTOR_POLICY,
+        "context_exclusions": "tables-figures-panel-lists-analysis-labels-ly49-v2",
+        "final_exact_gene_audit": True,
+        "kir_combination_policy": "exclude-shared-prefix-combinations",
         "pubtator3_pipeline_version": PUBTATOR3_PIPELINE_VERSION,
         "pubtator3_required": settings.pubtator3_required,
         "pubtator3_resolve_preferred_labels": (
@@ -72,7 +105,7 @@ def annotation_artifact_keys(
         and len(signature_parts[1]) == 32
         and all(character in "0123456789abcdef" for character in signature_parts[1])
     ):
-        root = f"runs/{signature_parts[1]}/stage2"
+        root = f"runs/{signature_parts[1]}/stage2/{signature_parts[2]}"
     else:
         root = (
             f"annotations/{source_sha256[:2]}/{source_sha256}/"
@@ -120,7 +153,7 @@ def source_artifact_from_summary(summary: Mapping[str, Any]) -> ArtifactRef:
     if not isinstance(raw_artifact, Mapping):
         raise ValueError(
             "This retrieval predates object publishing. Run Stage 1 again before "
-            "starting GPU annotation."
+            "starting entity annotation."
         )
     artifact = ArtifactRef.from_dict(raw_artifact)
     if not artifact.sha256:

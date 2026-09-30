@@ -1,15 +1,19 @@
-"""Command-line entry point for one local CPU Stage 2 entity-extraction job."""
+"""Command-line entry point for one local Stage 2 cell-extraction job."""
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
-from backend.modal_worker.pipeline import run_annotation_bundle
+from backend.cellexlink_lite.normalization import ensure_ab3p_healthy
+from backend.local_annotation_pipeline import run_local_annotation_bundle
+
+logger = logging.getLogger(__name__)
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -28,6 +32,23 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _configure_logging(payload: Mapping[str, Any]) -> None:
+    options = payload.get("options") if isinstance(payload.get("options"), Mapping) else {}
+    method_log = bool(options.get("normalization_method_log", False))
+    # Keep unrelated libraries quiet. The per-document diagnostic logger is
+    # promoted to INFO only when the explicit switch is enabled.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    if method_log:
+        for logger_name in (
+            "backend.cellexlink_lite.normalization",
+            "backend.pipeline.cell_annotation_worker",
+        ):
+            logging.getLogger(logger_name).setLevel(logging.INFO)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) != 1:
@@ -37,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("Local worker payload must be a JSON object.")
+    _configure_logging(payload)
+
     control = (
         payload.get("local_control")
         if isinstance(payload.get("local_control"), dict)
@@ -47,11 +70,18 @@ def main(argv: list[str] | None = None) -> int:
         str(control.get("model_cache_root") or "data/model_cache")
     ).expanduser().resolve()
 
+    options = (
+        payload.get("options")
+        if isinstance(payload.get("options"), Mapping)
+        else {}
+    )
+
     try:
-        result = run_annotation_bundle(
+        if not bool(options.get("disable_abbreviations", False)):
+            ensure_ab3p_healthy()
+        result = run_local_annotation_bundle(
             payload,
             model_cache_root=model_cache_root,
-            require_cuda=False,
         )
         _write_json_atomic(
             result_path,
@@ -59,14 +89,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     except Exception as exc:
+        logger.exception("Local Stage 2 cell worker failed")
         _write_json_atomic(
             result_path,
             {"state": "failed", "error": str(exc)},
         )
         return 1
     finally:
-        # The payload contains a short-lived callback token. It is unnecessary
-        # after the worker exits and should not become persistent local state.
+        # The payload contains a short-lived callback token and is not retained.
         payload_path.unlink(missing_ok=True)
 
 

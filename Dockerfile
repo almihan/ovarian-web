@@ -9,6 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_VERBOSITY=error \
     HF_HUB_DISABLE_PROGRESS_BARS=1 \
     TQDM_DISABLE=1 \
+    APP_ENV=production \
+    PUBLIC_PRECOMPUTED_ONLY=true \
     APP_DATA_DIR=/data
 
 WORKDIR /app
@@ -21,8 +23,10 @@ RUN python -m pip install --upgrade pip \
 # streaming merge. PyTorch, Transformers, CUDA libraries, and CellExLink model
 # checkpoints remain in Modal.
 COPY backend ./backend
+COPY data/precomputed_corpora ./data/precomputed_corpora
+COPY data/reference_data ./data/reference_data
 
-RUN mkdir -p /data/artifacts /data/model_cache /data/runs /data/work \
+RUN mkdir -p /data/artifacts /data/model_cache /data/reference_data /data/runs /data/work \
     /data/local_annotation_jobs /data/relation_jobs
 
 EXPOSE 8000

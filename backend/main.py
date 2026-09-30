@@ -12,12 +12,20 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.gzip import GZipMiddleware
 
+from backend.api.corpora import router as corpora_router
 from backend.api.networks import router as networks_router
 from backend.api.runs import router as runs_router
+from backend.api.updates import router as updates_router
 from backend.config import settings
 from backend.orchestrator import pipeline_orchestrator
+from backend.pipeline.entity_overlap import (
+    ENTITY_OVERLAP_POLICY,
+)
 from backend.runtime import run_registry
 from backend.services.network_repository import pyvis_asset_path
+from backend.services.corpus_store import ensure_corpus_store
+from backend.services.corpus_updates import corpus_update_service
+from backend.services.reference_resources import seed_reference_resources
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,10 +62,15 @@ _VENDOR_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
+    logger.info("[ENTITY_OVERLAP_POLICY] policy=%s", ENTITY_OVERLAP_POLICY)
+    ensure_corpus_store()
+    seed_reference_resources()
     pipeline_orchestrator.initialize()
+    corpus_update_service.initialize()
     try:
         yield
     finally:
+        corpus_update_service.shutdown()
         pipeline_orchestrator.shutdown()
 
 
@@ -65,8 +78,10 @@ app = FastAPI(title=settings.app_name, version="2.0.0", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+app.include_router(corpora_router)
 app.include_router(runs_router)
 app.include_router(networks_router)
+app.include_router(updates_router)
 
 
 @app.middleware("http")
@@ -86,7 +101,11 @@ async def browser_headers(request: Request, call_next):
         "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; "
         "form-action 'self'"
     )
-    if request.url.path in {"/", "/api/runs"} or request.url.path.startswith("/api/runs/"):
+    if (
+        request.url.path in {"/", "/api/runs"}
+        or request.url.path.startswith("/api/runs/")
+        or request.url.path.startswith("/api/corpora")
+    ):
         response.headers["Cache-Control"] = "no-store"
     if settings.environment.casefold() == "production":
         response.headers["Strict-Transport-Security"] = (
@@ -110,6 +129,7 @@ def landing_page(request: Request):
         context={
             "app_name": settings.app_name,
             "environment": settings.environment,
+            "public_precomputed_only": settings.public_precomputed_only,
             "controller_compute": (
                 "Local CPU"
                 if settings.environment.casefold() == "development"
@@ -126,6 +146,8 @@ def landing_page(request: Request):
 
 @app.get("/network/{run_id}", response_class=HTMLResponse)
 def network_explorer(request: Request, run_id: str):
+    if run_registry.get_private(run_id, "trusted_update", False):
+        raise HTTPException(status_code=404, detail="Run not found.")
     try:
         run = run_registry.public(run_id)
     except KeyError as exc:
@@ -204,16 +226,26 @@ def health() -> dict[str, str]:
 def system_status() -> dict[str, object]:
     return {
         "application": "ready",
-        "state_model": "ephemeral_page_runs",
+        "state_model": "session-restorable temporary runs",
         "persistent_user_jobs": False,
-        "shared_cache": ["default_stage1", "default_stage2", "default_stage3"],
+        "permanent_saved_corpora": [
+            "non_neoplastic_inflammatory",
+            "cancer_associated_inflammatory",
+        ],
         "custom_result_reuse": False,
+        "public_precomputed_only": settings.public_precomputed_only,
+        "monthly_updates_enabled": settings.monthly_updates_enabled,
+        "monthly_update_max_new_papers": settings.monthly_update_max_new_papers,
         "stage4_persistent": False,
         "cell_annotation_executor": settings.cell_annotation_backend,
         "cell_annotation_compute": (
             "Modal T4"
             if settings.cell_annotation_backend == "modal"
-            else "local CPU"
+            else (
+                "local auto (CUDA, Apple MPS, or CPU fallback)"
+                if settings.cell_local_device == "auto"
+                else "local CPU"
+            )
             if settings.cell_annotation_backend == "local"
             else "disabled"
         ),
@@ -225,4 +257,5 @@ def system_status() -> dict[str, object]:
         ),
         "network_generation_compute": "Railway/local CPU · temporary SQLite",
         "artifact_backend": settings.artifact_backend,
+        "entity_overlap_policy": ENTITY_OVERLAP_POLICY,
     }

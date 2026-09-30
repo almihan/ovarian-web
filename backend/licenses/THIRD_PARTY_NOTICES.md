@@ -20,6 +20,16 @@ bundled with this project and remain subject to NCBI/NLM policies and the rights
 attached to the underlying literature. Automated PubTator3 annotations can be
 incomplete or incorrect and should be reviewed for high-stakes uses.
 
+## HGNC and ChEBI reference data
+
+The application downloads the current HGNC complete set and ChEBI flat files
+at runtime; neither dataset is bundled in this repository. HGNC supplies
+approved human gene symbols/names and UniProt cross-references. ChEBI supplies
+chemical identifiers, preferred names, release metadata, and reviewed MeSH
+cross-references. ChEBI data are from https://www.ebi.ac.uk/chebi/ and are
+distributed under CC BY 4.0. The ChEBI release used by Stage 2 is retained in
+the output metadata.
+
 ## Cell Ontology hierarchy resource
 
 The Stage 4 explorer bundles a compact transformation of Cell Ontology release

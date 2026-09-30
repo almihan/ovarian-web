@@ -40,6 +40,28 @@ PubTator3 reference: Chih-Hsuan Wei et al., “PubTator 3.0: an AI-powered
 literature resource for unlocking biomedical knowledge,” *Nucleic Acids
 Research* 52(W1), 2024, W540–W546. DOI: 10.1093/nar/gkae235.
 
+## HGNC reference data
+
+Human gene/protein annotations are cross-walked from verified NCBI Gene IDs to
+approved records in the HGNC complete set. The application downloads the
+current TSV at runtime and does not bundle the HGNC dataset in this repository.
+HGNC identifiers, approved symbols/names, and HGNC-supplied UniProt accessions
+remain subject to the HGNC site's terms and attribution guidance.
+
+Source: https://www.genenames.org/download/
+
+## ChEBI reference data
+
+Hormone annotations can be cross-walked from MeSH to ChEBI using reviewed
+manual cross-references in the ChEBI flat files. The application downloads the
+current release at runtime, records the release number in normalized output,
+and does not bundle ChEBI data in this repository.
+
+ChEBI data are from https://www.ebi.ac.uk/chebi/ and are distributed under the
+Creative Commons Attribution 4.0 International license. The ChEBI
+release used by a run is available in the Stage 2 statistics and in
+`chebi_release` for ChEBI-normalized hormone annotations.
+
 ## Cell Ontology hierarchy resource
 
 The Stage 4 explorer bundles a compact transformation of Cell Ontology release

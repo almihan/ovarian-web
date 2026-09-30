@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from backend.cellexlink_lite.resources import (
+    CELL_HIERARCHY_RELEASE,
     CELL_ONTOLOGY_RELEASE,
     DEFAULT_HIERARCHY_PATH,
 )
@@ -80,7 +81,7 @@ class CellHierarchyIndex:
         self._alias_to_id: dict[str, str] = {}
         self._metadata: dict[str, Any] = {
             "ontology": "Cell Ontology",
-            "release": CELL_ONTOLOGY_RELEASE,
+            "release": CELL_HIERARCHY_RELEASE,
             "relation": "is_a",
         }
 
@@ -213,7 +214,13 @@ class CellHierarchyIndex:
 
     def source(self) -> dict[str, Any]:
         self._load()
-        return {"provider": "Bundled OBO Cell Ontology snapshot", **self._metadata}
+        return {
+            "provider": "Bundled OBO Cell Ontology snapshot",
+            **self._metadata,
+            "lexicon_release": CELL_ONTOLOGY_RELEASE,
+            "hierarchy_matches_lexicon": self._metadata.get("release")
+            == CELL_ONTOLOGY_RELEASE,
+        }
 
     def term_detail(self, value: Any) -> dict[str, Any]:
         self._load()

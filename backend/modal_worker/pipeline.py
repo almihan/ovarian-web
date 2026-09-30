@@ -1,9 +1,10 @@
 """Low-memory CellExLink branch for Modal GPU or local CPU execution.
 
-Only cell-type recognition and normalization run here.  PubTator3 executes on
-the Railway controller in parallel.  Modal publishes a text-free cell branch
-artifact and returns immediately, allowing the T4 to shut down without waiting
-for NCBI requests or the final merge.
+The document-level cell/hormone Ab3P prepass and CellExLink recognition and
+normalization run here. PubTator3 plus HGNC executes on the Railway controller
+in parallel. Modal publishes the local entity branch and returns immediately,
+allowing the T4 to shut down without waiting for NCBI requests or the final
+merge.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +30,16 @@ from backend.cellexlink_lite.resources import (
     DEFAULT_ABBREVIATIONS_PATH,
     DEFAULT_ONTOLOGY_PATH,
 )
-from backend.pipeline.cell_annotation_worker import run_nen, run_ner, utc_now
+from backend.pipeline.cell_annotation_worker import (
+    run_abbreviation_prepass,
+    run_nen,
+    run_ner,
+    utc_now,
+)
+from backend.pipeline.entity_lexicons import (
+    DEFAULT_HORMONE_LEXICON_PATH,
+    MESH_HORMONE_RESOURCE_VERSION,
+)
 from backend.pipeline.entity_artifacts import (
     CELL_BRANCH_FILENAME,
     CELL_BRANCH_SCHEMA,
@@ -164,6 +175,7 @@ class CallbackProgress:
         self.base_stats = dict(base_stats or {})
         self.last_post = 0.0
         self.last_progress = -1
+        self._guard = threading.Lock()
 
     def emit(
         self,
@@ -174,29 +186,38 @@ class CallbackProgress:
         stats: Mapping[str, Any],
         force: bool = False,
     ) -> None:
-        overall = int(
-            round(self.start + (self.end - self.start) * max(0, min(100, percent)) / 100)
-        )
-        now = time.monotonic()
-        should_post = (
-            force and overall in {int(self.start), int(self.end)}
-        ) or overall >= self.last_progress + 1 or now - self.last_post >= 1.0
-        if not should_post:
-            return
-        merged = dict(self.base_stats)
-        merged.update(dict(stats))
-        _post_callback(
-            self.callback,
-            {
-                "status": "processing",
-                "stage": stage,
-                "progress": overall,
-                "message": message,
-                "stats": merged,
-            },
-        )
-        self.last_post = now
-        self.last_progress = overall
+        with self._guard:
+            overall = int(
+                round(
+                    self.start
+                    + (self.end - self.start)
+                    * max(0, min(100, percent))
+                    / 100
+                )
+            )
+            overall = max(self.last_progress, overall)
+            now = time.monotonic()
+            should_post = (
+                force
+                or overall >= self.last_progress + 1
+                or now - self.last_post >= 1.0
+            )
+            if not should_post:
+                return
+            merged = dict(self.base_stats)
+            merged.update(dict(stats))
+            _post_callback(
+                self.callback,
+                {
+                    "status": "processing",
+                    "stage": stage,
+                    "progress": overall,
+                    "message": message,
+                    "stats": merged,
+                },
+            )
+            self.last_post = now
+            self.last_progress = overall
 
 
 def ensure_model_snapshot(
@@ -389,11 +410,30 @@ def run_annotation_bundle(
                 "nen_model": nen_repo,
                 "ontology_version": ONTOLOGY_VERSION,
                 "abbreviation_version": ABBREVIATION_VERSION,
+                "hormone_resource_version": MESH_HORMONE_RESOURCE_VERSION,
                 "abbreviations_enabled": not bool(
                     options.get("disable_abbreviations", False)
                 ),
                 "entries": entries,
             }
+
+            abbreviation_args = SimpleNamespace(
+                ontology_path=DEFAULT_ONTOLOGY_PATH,
+                hormone_lexicon_path=DEFAULT_HORMONE_LEXICON_PATH,
+                disable_abbreviations=bool(
+                    options.get("disable_abbreviations", False)
+                ),
+            )
+            abbreviation_stats = run_abbreviation_prepass(
+                abbreviation_args,
+                manifest,
+                CallbackProgress(
+                    callback,
+                    start=8,
+                    end=18,
+                    base_stats=base_stats,
+                ),
+            )
 
             ner_args = SimpleNamespace(
                 model=str(ner_snapshot),
@@ -410,7 +450,12 @@ def run_annotation_bundle(
             ner_stats = run_ner(
                 ner_args,
                 manifest,
-                CallbackProgress(callback, start=8, end=40, base_stats=base_stats),
+                CallbackProgress(
+                    callback,
+                    start=20,
+                    end=42,
+                    base_stats={**base_stats, **abbreviation_stats},
+                ),
             )
             _release_cuda()
             _post_callback(
@@ -418,12 +463,16 @@ def run_annotation_bundle(
                 {
                     "status": "processing",
                     "stage": "releasing_recognition",
-                    "progress": 42,
+                    "progress": 44,
                     "message": (
                         "Recognition finished; the NER model was released from "
                         f"{('GPU' if uses_cuda else 'system')} memory."
                     ),
-                    "stats": {**base_stats, **ner_stats},
+                    "stats": {
+                        **base_stats,
+                        **abbreviation_stats,
+                        **ner_stats,
+                    },
                 },
             )
 
@@ -449,7 +498,7 @@ def run_annotation_bundle(
                 disable_abbreviations=bool(
                     options.get("disable_abbreviations", False)
                 ),
-                batch_size=max(1, int(options.get("nen_batch_size") or 64)),
+                batch_size=max(1, int(options.get("nen_batch_size") or 128)),
                 request_batch_size=max(
                     1, int(options.get("nen_request_batch_size") or 128)
                 ),
@@ -462,9 +511,13 @@ def run_annotation_bundle(
                 manifest,
                 CallbackProgress(
                     callback,
-                    start=44,
+                    start=46,
                     end=72,
-                    base_stats={**base_stats, **ner_stats},
+                    base_stats={
+                        **base_stats,
+                        **abbreviation_stats,
+                        **ner_stats,
+                    },
                 ),
             )
             _release_cuda()
@@ -481,7 +534,12 @@ def run_annotation_bundle(
                     "stage": "building_cell_branch",
                     "progress": 74,
                     "message": "Building the text-free CellExLink branch artifact.",
-                    "stats": {**base_stats, **ner_stats, **nen_stats},
+                    "stats": {
+                        **base_stats,
+                        **abbreviation_stats,
+                        **ner_stats,
+                        **nen_stats,
+                    },
                 },
             )
 
@@ -495,15 +553,18 @@ def run_annotation_bundle(
             cell_output_sha = sha256_path(cell_output)
             cell_elapsed = round(time.monotonic() - started, 2)
             cell_count = int(entity_counts["cell"])
+            hormone_count = int(entity_counts["hormone"])
             stats = {
                 **base_stats,
+                **abbreviation_stats,
                 **ner_stats,
                 **nen_stats,
                 "cell_branch_status": "completed",
                 "cell_branch_schema": CELL_BRANCH_SCHEMA,
                 "cell_output_chunk_count": output_chunk_count,
-                "mention_count": cell_count,
+                "mention_count": int(entity_counts["total"]),
                 "cell_count": cell_count,
+                "hormone_count": hormone_count,
                 "normalized_count": int(
                     nen_stats.get("normalized_occurrences") or 0
                 ),
@@ -564,8 +625,9 @@ def run_annotation_bundle(
             )
 
             message = (
-                f"CellExLink finished with {cell_count:,} cell-type annotations. "
-                "Railway will merge them with its PubTator3 branch."
+                f"The CellExLink/Ab3P branch finished with {cell_count:,} "
+                f"cell-type and {hormone_count:,} Ab3P hormone annotations. "
+                "Railway will merge them with its PubTator3/HGNC branch."
             )
             summary = {
                 "status": "completed",

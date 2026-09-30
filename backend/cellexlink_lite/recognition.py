@@ -161,11 +161,15 @@ class ChunkNER:
         window_batch_size: int = 4,
         cpu_threads: int = 2,
         trust_remote_code: bool = False,
+        device: str = "auto",
     ) -> None:
         if window_batch_size < 1:
             raise ValueError("window_batch_size must be >= 1")
         if doc_stride < 0:
             raise ValueError("doc_stride must be >= 0")
+        requested_device = str(device or "auto").strip().casefold()
+        if requested_device not in {"auto", "cpu"}:
+            raise ValueError("device must be either 'auto' or 'cpu'")
 
         _set_torch_threads(cpu_threads)
 
@@ -176,7 +180,9 @@ class ChunkNER:
         self.model_reference = str(model_name_or_path)
         self.cache_dir = str(cache_dir) if cache_dir is not None else None
         self.window_batch_size = int(window_batch_size)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.requested_device = requested_device
+        self.device = self._resolve_device(torch, requested_device)
+        self.compute_device = self._device_display_name(torch, self.device)
 
         common_kwargs = {
             "cache_dir": self.cache_dir,
@@ -205,7 +211,14 @@ class ChunkNER:
             config=self.config,
             **common_kwargs,
         )
-        self.model.to(self.device)
+        try:
+            self.model.to(self.device)
+        except Exception:
+            if getattr(self.device, "type", "cpu") == "cpu":
+                raise
+            self.device = torch.device("cpu")
+            self.compute_device = "CPU"
+            self.model.to(self.device)
         self.model.eval()
 
         self.max_seq_length = _effective_max_length(
@@ -213,6 +226,28 @@ class ChunkNER:
         )
         max_stride = max(0, self.max_seq_length - 8)
         self.doc_stride = min(int(doc_stride), max_stride)
+
+    @staticmethod
+    def _resolve_device(torch: Any, requested_device: str) -> Any:
+        if requested_device == "cpu":
+            return torch.device("cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    @staticmethod
+    def _device_display_name(torch: Any, device: Any) -> str:
+        if getattr(device, "type", "cpu") == "cuda":
+            try:
+                return f"CUDA: {torch.cuda.get_device_name(device)}"
+            except Exception:
+                return "CUDA GPU"
+        if getattr(device, "type", "cpu") == "mps":
+            return "Apple Metal (MPS)"
+        return "CPU"
 
     def predict_texts(self, texts: Sequence[str]) -> list[list[EntitySpan]]:
         """Predict spans for a bounded batch of raw chunk strings."""

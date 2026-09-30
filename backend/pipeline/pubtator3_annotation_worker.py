@@ -1,15 +1,10 @@
-"""Low-memory PubTator3 gene and hormone annotation for Stage 2.
+"""PubTator3 gene/protein and MeSH hormone annotation for Stage 2.
 
-The worker reads one paper at a time and requests PubTator3 BioC JSON in bounded
-batches. Every parseable PubTator3 ``Gene``, ``Gene/Protein``, and ``Protein``
-annotation is first retained in an ephemeral provisional sidecar. Unique NCBI
-Gene IDs are then resolved once through NCBI Gene ESummary, and only records
-whose authoritative metadata has ``tax_id=9606`` are written to the Stage 2
-artifact. PubTator3 Chemical annotations are normalized to MeSH and retained
-only when the MeSH concept belongs to the biological Hormones hierarchy
-(D06.472), or when a MeSH supplementary concept maps to that hierarchy. Sparse,
-text-free per-paper sidecars and a small SQLite cache keep Railway memory,
-storage, and repeated network traffic low.
+Gene IDs map directly to approved HGNC records. No species validation or human
+NCBI reference download is performed; unmapped genes are discarded. General
+HGNC exact-name recovery remains enabled, with no hard-coded gene overrides.
+Chemicals are retained only when their MeSH IDs belong to the local hormone
+lexicon. Complete receptor expressions are reconciled before branch merging.
 """
 
 from __future__ import annotations
@@ -21,7 +16,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import tempfile
 import time
 import unicodedata
@@ -32,7 +26,24 @@ from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 import requests
 from requests.adapters import HTTPAdapter
 
-from backend.pipeline.taxonomy import HUMAN_TAX_ID, HUMAN_TAX_NAME, normalize_tax_id
+from backend.pipeline.entity_lexicons import (
+    DEFAULT_HORMONE_LEXICON_PATH,
+    HormoneLexiconEntry,
+    MESH_HORMONE_DESCRIPTOR_ID,
+    MESH_HORMONE_RESOURCE_VERSION,
+    MESH_HORMONE_TREE_PREFIX,
+    ensure_hormone_lexicon,
+)
+from backend.pipeline.reference_normalization import (
+    CachedFileStatus,
+    HgncExactMatcher,
+    HgncRecord,
+    build_hgnc_exact_matcher,
+    ensure_hgnc_reference,
+    normalize_mesh_id,
+    reference_download_stats,
+    resolve_hgnc_by_entrez,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,24 +55,19 @@ PUBTATOR3_PMC_EXPORT = (
     "https://www.ncbi.nlm.nih.gov/research/pubtator3-api/"
     "publications/pmc_export/biocjson"
 )
-NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-MESH_RDF_SPARQL = "https://id.nlm.nih.gov/mesh/sparql"
-MESH_RDF_RESOURCE = "https://id.nlm.nih.gov/mesh"
-
-# Official MeSH biological hierarchy for Hormones. The second tree attached to
-# D006728 is a pharmacologic-action hierarchy and is intentionally not used for
-# ordinary descriptor membership. Supplementary concepts are retained when they
-# map to a descriptor in this branch or explicitly carry D006728 as a
-# pharmacological action.
-MESH_HORMONE_DESCRIPTOR_ID = "D006728"
-MESH_HORMONE_TREE_PREFIX = "D06.472"
-_MESH_HORMONE_CACHE_KIND = "mesh-hormone-d06.472-rdf-v2"
-_GENE_METADATA_CACHE_SOURCE = "ncbi-gene-esummary-taxonomy-v1"
-_HORMONE_LABEL_CACHE_SOURCE = "mesh-rdf-authoritative-label-v1"
+# Hormone classification is a local set-membership lookup against the bundled
+# 2026 MeSH descriptors under D06.472. It intentionally does not call MeSH RDF.
 
 PUBTATOR3_ANNOTATIONS_FILENAME = "pubtator3_annotations.jsonl.gz"
 PUBTATOR3_PROVISIONAL_FILENAME = ".pubtator3_annotations.provisional.jsonl"
-PUBTATOR3_PIPELINE_VERSION = "pubtator3-ncbi-human-gene-hormone-v7"
+PUBTATOR3_PIPELINE_VERSION = "pubtator3-hgnc-only-panel-safe-v21-get100"
+
+# PubTator3 publication-export endpoints are queried with comma-separated IDs.
+# Keep each GET request at or below 100 identifiers so the request remains
+# within the service's supported URL/query size and does not fail as an empty
+# form-POST response.
+PUBTATOR3_DEFAULT_BATCH_SIZE = 100
+PUBTATOR3_MAX_GET_BATCH_SIZE = 100
 
 SOURCE_FIELDS = (
     "base",
@@ -258,19 +264,29 @@ class RequestPacer:
 
 @dataclass(frozen=True)
 class PubTator3Config:
-    batch_size: int = 20
+    batch_size: int = PUBTATOR3_DEFAULT_BATCH_SIZE
     request_timeout: int = 120
     max_attempts: int = 4
     required: bool = True
     resolve_preferred_labels: bool = True
-    ncbi_tool: str = "ovarian_network_web"
+    ncbi_tool: str = "ovarian_network_ncbigene_mesh"
     ncbi_email: str = ""
+    reference_data_cache_dir: str = ""
 
     @classmethod
     def from_options(cls, options: Mapping[str, Any] | None) -> "PubTator3Config":
         raw = options or {}
         return cls(
-            batch_size=max(1, min(100, int(raw.get("pubtator_batch_size") or 20))),
+            batch_size=max(
+                1,
+                min(
+                    PUBTATOR3_MAX_GET_BATCH_SIZE,
+                    int(
+                        raw.get("pubtator_batch_size")
+                        or PUBTATOR3_DEFAULT_BATCH_SIZE
+                    ),
+                ),
+            ),
             request_timeout=max(
                 20, min(300, int(raw.get("pubtator_request_timeout") or 120))
             ),
@@ -279,8 +295,14 @@ class PubTator3Config:
             resolve_preferred_labels=_option_bool(
                 raw.get("pubtator_resolve_preferred_labels"), default=True
             ),
-            ncbi_tool=_clean_text(raw.get("ncbi_tool")) or "ovarian_network_web",
+            ncbi_tool=(
+                _clean_text(raw.get("ncbi_tool"))
+                or "ovarian_network_ncbigene_mesh"
+            ),
             ncbi_email=_clean_text(raw.get("ncbi_email")),
+            reference_data_cache_dir=_clean_text(
+                raw.get("reference_data_cache_dir")
+            ),
         )
 
 
@@ -296,33 +318,13 @@ class _GeneIdentifierMetrics:
     """Counts PubTator3 gene identifiers parsed before metadata filtering."""
 
     parsed_identifiers: int = 0
-    scoped_identifiers: int = 0
-    unscoped_identifiers: int = 0
     invalid_identifiers: int = 0
 
 
 @dataclass(frozen=True, slots=True)
-class ParsedGeneIdentifier:
-    gene_id: str
-    pubtator_tax_id: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class GeneMetadata:
-    gene_id: str
-    tax_id: str
-    tax_name: str
-    symbol: str = ""
-    status: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class GeneMetadataResult:
-    records: dict[str, GeneMetadata]
-    human_records: dict[str, GeneMetadata]
-    non_human_ids: set[str]
-    unresolved_ids: set[str]
-    cache_hits: int = 0
+class HormoneCanonicalMetadata:
+    mesh_id: str
+    preferred_label: str
 
 
 def _build_session(config: PubTator3Config) -> requests.Session:
@@ -335,8 +337,7 @@ def _build_session(config: PubTator3Config) -> requests.Session:
         {
             "User-Agent": f"{config.ncbi_tool}/1.0{contact}",
             "Accept": (
-                "application/sparql-results+json, application/json, "
-                "application/rdf+json, application/x-ndjson, "
+                "application/json, application/x-ndjson, "
                 "application/xml, text/xml;q=0.9"
             ),
             "Accept-Encoding": "gzip, deflate",
@@ -404,6 +405,34 @@ def _request_bytes(
     if last_error is not None:
         raise RuntimeError(f"{context} failed after {config.max_attempts} attempts: {last_error}")
     raise RuntimeError(f"{context} failed without a response.")
+
+
+def _request_pubtator_export_batch(
+    session: requests.Session,
+    pacer: RequestPacer,
+    metrics: _RequestMetrics,
+    *,
+    url: str,
+    identifier_field: str,
+    identifiers: Sequence[str],
+    context: str,
+    config: PubTator3Config,
+) -> requests.Response:
+    """Send one PubTator3 export GET request for a bounded ID batch."""
+
+    if identifier_field not in {"pmids", "pmcids"}:
+        raise ValueError("identifier_field must be 'pmids' or 'pmcids'.")
+    return _request_bytes(
+        session,
+        pacer,
+        metrics,
+        method="GET",
+        url=url,
+        context=context,
+        config=config,
+        params={identifier_field: ",".join(identifiers)},
+        accepted_statuses={400, 404},
+    )
 
 
 def _decode_json_values(content: bytes) -> list[Any]:
@@ -676,34 +705,25 @@ def _parse_gene_identifiers(
     raw: Any,
     *,
     metrics: _GeneIdentifierMetrics | None = None,
-) -> tuple[ParsedGeneIdentifier, ...]:
-    """Parse all usable PubTator3 NCBI Gene IDs without species filtering.
+) -> tuple[str, ...]:
+    """Parse numeric Gene IDs, ignoring optional taxonomy prefixes.
 
-    PubTator3 may emit a plain Gene ID, such as ``3558`` or
-    ``NCBIGene:3558``, or a taxon-scoped form such as ``9606:3558``. The taxon
-    prefix is retained only for diagnostics. NCBI Gene metadata is the sole
-    source used later to decide whether a gene is human.
+    Both ``9606:3558`` and another taxon-scoped ID are parsed the same way.
+    Acceptance depends only on a subsequent approved HGNC mapping.
     """
 
-    parsed_by_gene_id: dict[str, ParsedGeneIdentifier] = {}
+    parsed_gene_ids: list[str] = []
+    seen: set[str] = set()
     for value in _split_identifiers(raw):
         cleaned = re.sub(
             r"(?i)^(?:NCBI\s*Gene|NCBIGene|GeneID|Gene)\s*[:#]?\s*", "", value
         ).strip()
-        tax_id = ""
+        pair = re.fullmatch(r"(?:(\d+)\s*:\s*)?(\d+)", cleaned)
         gene_id = ""
-
-        if re.fullmatch(r"\d+", cleaned):
-            gene_id = normalize_tax_id(cleaned)
-            if metrics is not None:
-                metrics.unscoped_identifiers += 1
-        else:
-            pair = re.fullmatch(r"(\d+)\s*:\s*(\d+)", cleaned)
-            if pair is not None:
-                tax_id = normalize_tax_id(pair.group(1))
-                gene_id = normalize_tax_id(pair.group(2))
-                if metrics is not None:
-                    metrics.scoped_identifiers += 1
+        if pair is not None:
+            gene_id = pair.group(2).lstrip("0") or "0"
+            if gene_id == "0":
+                gene_id = ""
 
         if not gene_id:
             if metrics is not None:
@@ -712,20 +732,17 @@ def _parse_gene_identifiers(
 
         if metrics is not None:
             metrics.parsed_identifiers += 1
-        current = parsed_by_gene_id.get(gene_id)
-        if current is None or (not current.pubtator_tax_id and tax_id):
-            parsed_by_gene_id[gene_id] = ParsedGeneIdentifier(
-                gene_id=gene_id,
-                pubtator_tax_id=tax_id,
-            )
+        if gene_id not in seen:
+            seen.add(gene_id)
+            parsed_gene_ids.append(gene_id)
 
-    return tuple(parsed_by_gene_id.values())
+    return tuple(parsed_gene_ids)
 
 
 def _normalize_gene_ids(raw: Any) -> tuple[str, ...]:
-    """Return all parseable NCBI Gene IDs, irrespective of organism."""
+    """Return parseable NCBI Gene IDs without a species filter."""
 
-    return tuple(item.gene_id for item in _parse_gene_identifiers(raw))
+    return _parse_gene_identifiers(raw)
 
 
 def _normalize_chemical_ids(raw: Any) -> tuple[str, ...]:
@@ -832,24 +849,21 @@ def _annotation_rows_for_passage(
             continue
         infons = annotation.get("infons")
         infons = infons if isinstance(infons, Mapping) else {}
+        source_entity_type = _clean_text(
+            infons.get("type") or infons.get("entity_type")
+        )
         entity_type = _entity_type(infons)
         if entity_type is None:
             continue
         raw_identifier = _annotation_identifier(infons)
         if entity_type == "gene":
-            parsed_gene_ids = _parse_gene_identifiers(
+            identifiers = _parse_gene_identifiers(
                 raw_identifier,
                 metrics=gene_identifier_metrics,
             )
-            identifiers_with_tax = tuple(
-                (item.gene_id, item.pubtator_tax_id) for item in parsed_gene_ids
-            )
         else:
-            identifiers_with_tax = tuple(
-                (identifier, "")
-                for identifier in _normalize_chemical_ids(raw_identifier)
-            )
-        if not identifiers_with_tax:
+            identifiers = _normalize_chemical_ids(raw_identifier)
+        if not identifiers:
             continue
         locations = annotation.get("locations") or annotation.get("location") or []
         if isinstance(locations, Mapping):
@@ -867,7 +881,7 @@ def _annotation_rows_for_passage(
             if not (0 <= start < end <= len(chunk_text)):
                 continue
             mention = chunk_text[start:end]
-            for identifier, pubtator_tax_id in identifiers_with_tax:
+            for identifier in identifiers:
                 key = (entity_type, identifier)
                 concept_ids[entity_type].add(identifier)
                 concept_id = (
@@ -888,12 +902,12 @@ def _annotation_rows_for_passage(
                         "mention": mention,
                         "concept_id": concept_id,
                         "normalization_source": "PubTator3",
+                        "source_entity_type": source_entity_type,
                     }
                 )
                 if entity_type == "gene":
                     row["gene_id"] = identifier
-                    if pubtator_tax_id:
-                        row["pubtator_tax_id"] = pubtator_tax_id
+                    row["identified_source"] = "pubtator3"
                 else:
                     row["chemical_id"] = identifier
                 rows.append(row)
@@ -906,8 +920,10 @@ class _EntryState:
     provisional_path: Path
     pmid: str | None = None
     pmcid: str | None = None
+    text_mode: str = ""
     chunk_count: int = 0
-    title_abstract_chunks: set[int] = field(default_factory=set)
+    abstract_chunks: set[int] = field(default_factory=set)
+    annotatable_chunks: set[int] = field(default_factory=set)
     covered_chunks: set[int] = field(default_factory=set)
     document_seen: bool = False
     annotations_written: int = 0
@@ -920,10 +936,21 @@ def _process_document_for_state(
     concept_ids: MutableMapping[str, set[str]],
     gene_identifier_metrics: _GeneIdentifierMetrics,
     only_uncovered: bool,
+    allowed_chunk_indexes: set[int] | None = None,
 ) -> tuple[int, int, int]:
     chunks = list(_iter_jsonl(Path(str(state.entry["chunk_path"]))))
-    allowed = set(range(len(chunks))) - state.covered_chunks if only_uncovered else None
-    matches = _match_passages_to_chunks(document, chunks, allowed_chunk_indexes=allowed)
+    allowed = set(
+        state.annotatable_chunks
+        if allowed_chunk_indexes is None
+        else allowed_chunk_indexes & state.annotatable_chunks
+    )
+    if only_uncovered:
+        allowed -= state.covered_chunks
+    matches = _match_passages_to_chunks(
+        document,
+        chunks,
+        allowed_chunk_indexes=allowed,
+    )
     rows: list[dict[str, Any]] = []
     for passage, chunk_index in matches:
         state.covered_chunks.add(chunk_index)
@@ -941,683 +968,6 @@ def _process_document_for_state(
     return len(matches), written, len(chunks)
 
 
-class LabelCache:
-    """Small persistent cache for gene metadata, labels, and hormones."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(path, timeout=30)
-        self.connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS preferred_labels (
-                entity_type TEXT NOT NULL,
-                concept_id TEXT NOT NULL,
-                preferred_label TEXT NOT NULL,
-                source TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(entity_type, concept_id)
-            )
-            """
-        )
-        self.connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS hormone_membership (
-                identifier_type TEXT NOT NULL,
-                concept_id TEXT NOT NULL,
-                is_hormone INTEGER NOT NULL,
-                evidence TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(identifier_type, concept_id)
-            )
-            """
-        )
-        self.connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS gene_metadata (
-                source TEXT NOT NULL,
-                gene_id TEXT NOT NULL,
-                tax_id TEXT NOT NULL,
-                tax_name TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                status TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(source, gene_id)
-            )
-            """
-        )
-        self.connection.commit()
-
-    def close(self) -> None:
-        self.connection.commit()
-        self.connection.close()
-
-    def get_many(
-        self,
-        entity_type: str,
-        concept_ids: Iterable[str],
-        *,
-        source: str,
-    ) -> dict[str, str]:
-        values = tuple(dict.fromkeys(concept_ids))
-        found: dict[str, str] = {}
-        for batch in _batched(values, 500):
-            placeholders = ",".join("?" for _ in batch)
-            rows = self.connection.execute(
-                f"""
-                SELECT concept_id, preferred_label
-                FROM preferred_labels
-                WHERE entity_type = ?
-                  AND source = ?
-                  AND concept_id IN ({placeholders})
-                """,
-                (entity_type, source, *batch),
-            ).fetchall()
-            found.update({str(row[0]): str(row[1]) for row in rows})
-        return found
-
-    def put_many(self, entity_type: str, labels: Mapping[str, str], source: str) -> None:
-        rows = [
-            (entity_type, concept_id, label, source)
-            for concept_id, label in labels.items()
-            if concept_id and label
-        ]
-        if not rows:
-            return
-        self.connection.executemany(
-            """
-            INSERT INTO preferred_labels (
-                entity_type, concept_id, preferred_label, source
-            ) VALUES (?, ?, ?, ?)
-            ON CONFLICT(entity_type, concept_id) DO UPDATE SET
-                preferred_label = excluded.preferred_label,
-                source = excluded.source,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            rows,
-        )
-        self.connection.commit()
-
-    def get_gene_metadata(
-        self,
-        gene_ids: Iterable[str],
-        *,
-        source: str,
-    ) -> dict[str, GeneMetadata]:
-        values = tuple(dict.fromkeys(gene_ids))
-        found: dict[str, GeneMetadata] = {}
-        for batch in _batched(values, 500):
-            placeholders = ",".join("?" for _ in batch)
-            rows = self.connection.execute(
-                f"""
-                SELECT gene_id, tax_id, tax_name, symbol, status
-                FROM gene_metadata
-                WHERE source = ? AND gene_id IN ({placeholders})
-                """,
-                (source, *batch),
-            ).fetchall()
-            for gene_id, tax_id, tax_name, symbol, status in rows:
-                normalized_gene_id = normalize_tax_id(gene_id)
-                normalized_tax_id = normalize_tax_id(tax_id)
-                if not normalized_gene_id or not normalized_tax_id:
-                    continue
-                found[normalized_gene_id] = GeneMetadata(
-                    gene_id=normalized_gene_id,
-                    tax_id=normalized_tax_id,
-                    tax_name=_clean_text(tax_name),
-                    symbol=_clean_text(symbol),
-                    status=_clean_text(status),
-                )
-        return found
-
-    def put_gene_metadata(
-        self,
-        records: Mapping[str, GeneMetadata],
-        *,
-        source: str,
-    ) -> None:
-        rows = [
-            (
-                source,
-                record.gene_id,
-                record.tax_id,
-                record.tax_name,
-                record.symbol,
-                record.status,
-            )
-            for record in records.values()
-            if record.gene_id and record.tax_id
-        ]
-        if not rows:
-            return
-        self.connection.executemany(
-            """
-            INSERT INTO gene_metadata (
-                source, gene_id, tax_id, tax_name, symbol, status
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source, gene_id) DO UPDATE SET
-                tax_id = excluded.tax_id,
-                tax_name = excluded.tax_name,
-                symbol = excluded.symbol,
-                status = excluded.status,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            rows,
-        )
-        self.connection.commit()
-
-    def get_hormone_membership(
-        self,
-        identifier_type: str,
-        concept_ids: Iterable[str],
-    ) -> dict[str, tuple[bool, str]]:
-        values = tuple(dict.fromkeys(concept_ids))
-        found: dict[str, tuple[bool, str]] = {}
-        for batch in _batched(values, 500):
-            placeholders = ",".join("?" for _ in batch)
-            rows = self.connection.execute(
-                f"""
-                SELECT concept_id, is_hormone, evidence
-                FROM hormone_membership
-                WHERE identifier_type = ? AND concept_id IN ({placeholders})
-                """,
-                (identifier_type, *batch),
-            ).fetchall()
-            found.update(
-                {
-                    str(row[0]): (bool(int(row[1])), str(row[2]))
-                    for row in rows
-                }
-            )
-        return found
-
-    def put_hormone_membership(
-        self,
-        identifier_type: str,
-        classifications: Mapping[str, tuple[bool, str]],
-    ) -> None:
-        rows = [
-            (identifier_type, concept_id, int(is_hormone), evidence)
-            for concept_id, (is_hormone, evidence) in classifications.items()
-            if concept_id and evidence
-        ]
-        if not rows:
-            return
-        self.connection.executemany(
-            """
-            INSERT INTO hormone_membership (
-                identifier_type, concept_id, is_hormone, evidence
-            ) VALUES (?, ?, ?, ?)
-            ON CONFLICT(identifier_type, concept_id) DO UPDATE SET
-                is_hormone = excluded.is_hormone,
-                evidence = excluded.evidence,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            rows,
-        )
-        self.connection.commit()
-
-
-def _ncbi_common_params(config: PubTator3Config) -> dict[str, str]:
-    params = {"tool": config.ncbi_tool}
-    if config.ncbi_email:
-        params["email"] = config.ncbi_email
-    return params
-
-
-def _gene_metadata_from_esummary_record(
-    requested_gene_id: str,
-    record: Mapping[str, Any],
-) -> GeneMetadata | None:
-    gene_id = normalize_tax_id(record.get("uid") or requested_gene_id)
-    if not gene_id or gene_id != requested_gene_id:
-        return None
-
-    organism = record.get("organism")
-    organism = organism if isinstance(organism, Mapping) else {}
-    tax_id = normalize_tax_id(
-        organism.get("taxid")
-        or organism.get("tax_id")
-        or record.get("taxid")
-        or record.get("tax_id")
-    )
-    if not tax_id:
-        return None
-
-    tax_name = _clean_text(
-        organism.get("scientificname")
-        or organism.get("scientific_name")
-        or record.get("taxname")
-        or record.get("tax_name")
-    )
-    if tax_id == HUMAN_TAX_ID and not tax_name:
-        tax_name = HUMAN_TAX_NAME
-
-    return GeneMetadata(
-        gene_id=gene_id,
-        tax_id=tax_id,
-        tax_name=tax_name,
-        symbol=_clean_text(record.get("name")),
-        status=_clean_text(record.get("status")),
-    )
-
-
-def _resolve_human_gene_metadata(
-    gene_ids: Sequence[str],
-    *,
-    cache: LabelCache,
-    session: requests.Session,
-    pacer: RequestPacer,
-    metrics: _RequestMetrics,
-    config: PubTator3Config,
-) -> GeneMetadataResult:
-    """Resolve every unique Gene ID once and select human records by metadata."""
-
-    requested = tuple(
-        dict.fromkeys(
-            normalized
-            for value in gene_ids
-            if (normalized := normalize_tax_id(value))
-        )
-    )
-    records = cache.get_gene_metadata(
-        requested,
-        source=_GENE_METADATA_CACHE_SOURCE,
-    )
-    cache_hits = len(records)
-    missing = tuple(gene_id for gene_id in requested if gene_id not in records)
-
-    for batch in _batched(missing, 200):
-        params = {
-            "db": "gene",
-            "id": ",".join(batch),
-            "retmode": "json",
-            **_ncbi_common_params(config),
-        }
-        response = _request_bytes(
-            session,
-            pacer,
-            metrics,
-            method="GET",
-            url=NCBI_ESUMMARY,
-            context="NCBI Gene taxonomy metadata lookup",
-            config=config,
-            params=params,
-        )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError(
-                "NCBI Gene taxonomy metadata lookup returned invalid JSON."
-            ) from exc
-        result = payload.get("result") if isinstance(payload, Mapping) else None
-        if not isinstance(result, Mapping):
-            raise RuntimeError(
-                "NCBI Gene taxonomy metadata lookup returned an invalid payload."
-            )
-        uids = result.get("uids") or []
-        if not isinstance(uids, (list, tuple)):
-            raise RuntimeError(
-                "NCBI Gene taxonomy metadata lookup returned an invalid UID list."
-            )
-
-        resolved_batch: dict[str, GeneMetadata] = {}
-        batch_set = set(batch)
-        for uid in uids:
-            requested_gene_id = normalize_tax_id(uid)
-            if requested_gene_id not in batch_set:
-                continue
-            record = result.get(str(uid))
-            if not isinstance(record, Mapping) or record.get("error"):
-                continue
-            metadata = _gene_metadata_from_esummary_record(
-                requested_gene_id,
-                record,
-            )
-            if metadata is not None:
-                resolved_batch[metadata.gene_id] = metadata
-
-        records.update(resolved_batch)
-        cache.put_gene_metadata(
-            resolved_batch,
-            source=_GENE_METADATA_CACHE_SOURCE,
-        )
-
-    unresolved_ids = set(requested) - set(records)
-    human_records = {
-        gene_id: metadata
-        for gene_id, metadata in records.items()
-        if metadata.tax_id == HUMAN_TAX_ID
-    }
-    non_human_ids = {
-        gene_id
-        for gene_id, metadata in records.items()
-        if metadata.tax_id != HUMAN_TAX_ID
-    }
-    return GeneMetadataResult(
-        records=records,
-        human_records=human_records,
-        non_human_ids=non_human_ids,
-        unresolved_ids=unresolved_ids,
-        cache_hits=cache_hits,
-    )
-
-
-def _sparql_binding_value(binding: Mapping[str, Any], key: str) -> str:
-    value = binding.get(key)
-    if not isinstance(value, Mapping):
-        return ""
-    return _clean_text(value.get("value"))
-
-
-def _mesh_uri_tail(value: str) -> str:
-    cleaned = _clean_text(value).rstrip("/")
-    if not cleaned:
-        return ""
-    return cleaned.rsplit("/", 1)[-1]
-
-
-def _mesh_uri_values(value: str) -> tuple[str, ...]:
-    output: list[str] = []
-    for item in str(value or "").split("|"):
-        identifier = _mesh_uri_tail(item)
-        if identifier:
-            output.append(identifier)
-    return tuple(dict.fromkeys(output))
-
-
-@dataclass(frozen=True)
-class MeshRecord:
-    mesh_id: str
-    label: str
-    record_type: str
-    tree_numbers: tuple[str, ...] = ()
-    mapped_descriptor_ids: tuple[str, ...] = ()
-    pharmacological_action_ids: tuple[str, ...] = ()
-
-
-def _rdf_json_values(
-    properties: Mapping[str, Any],
-    predicate_name: str,
-) -> tuple[str, ...]:
-    values: list[str] = []
-    for predicate, raw_items in properties.items():
-        local_name = str(predicate).rsplit("#", 1)[-1].rsplit("/", 1)[-1]
-        if local_name != predicate_name:
-            continue
-        items = raw_items if isinstance(raw_items, list) else [raw_items]
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            value = _clean_text(item.get("value"))
-            if value:
-                values.append(value)
-    return tuple(dict.fromkeys(values))
-
-
-def _parse_mesh_rdf_json_record(
-    payload: Any,
-    mesh_id: str,
-) -> MeshRecord | None:
-    if not isinstance(payload, Mapping):
-        raise RuntimeError("MeSH RDF resource returned an invalid JSON object.")
-
-    properties: Mapping[str, Any] | None = None
-    for subject, raw_properties in payload.items():
-        if _mesh_uri_tail(str(subject)).upper() != mesh_id:
-            continue
-        if isinstance(raw_properties, Mapping):
-            properties = raw_properties
-            break
-    if properties is None:
-        return None
-
-    labels = _rdf_json_values(properties, "label")
-    tree_numbers = tuple(
-        value
-        for value in (
-            _mesh_uri_tail(uri)
-            for uri in _rdf_json_values(properties, "treeNumber")
-        )
-        if re.fullmatch(r"[A-Z]\d+(?:\.\d+)*", value)
-    )
-    mapped_values = (
-        *_rdf_json_values(properties, "mappedTo"),
-        *_rdf_json_values(properties, "preferredMappedTo"),
-    )
-    mapped_descriptor_ids = tuple(
-        dict.fromkeys(
-            value.upper()
-            for value in (_mesh_uri_tail(uri) for uri in mapped_values)
-            if re.fullmatch(r"(?i)D\d+", value)
-        )
-    )
-    pharmacological_action_ids = tuple(
-        dict.fromkeys(
-            value.upper()
-            for value in (
-                _mesh_uri_tail(uri)
-                for uri in _rdf_json_values(properties, "pharmacologicalAction")
-            )
-            if re.fullmatch(r"(?i)D\d+", value)
-        )
-    )
-    return MeshRecord(
-        mesh_id=mesh_id,
-        label=labels[0] if labels else "",
-        record_type="supplementary" if mesh_id.startswith("C") else "descriptor",
-        tree_numbers=tuple(dict.fromkeys(tree_numbers)),
-        mapped_descriptor_ids=mapped_descriptor_ids,
-        pharmacological_action_ids=pharmacological_action_ids,
-    )
-
-
-def _fetch_mesh_record_direct(
-    mesh_id: str,
-    *,
-    session: requests.Session,
-    pacer: RequestPacer,
-    metrics: _RequestMetrics,
-    config: PubTator3Config,
-) -> MeshRecord | None:
-    response = _request_bytes(
-        session,
-        pacer,
-        metrics,
-        method="GET",
-        url=f"{MESH_RDF_RESOURCE}/{mesh_id}.json",
-        context=f"MeSH RDF resource lookup for {mesh_id}",
-        config=config,
-        accepted_statuses={404},
-    )
-    if response.status_code == 404:
-        return None
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"MeSH RDF resource returned invalid JSON for {mesh_id}."
-        ) from exc
-    return _parse_mesh_rdf_json_record(payload, mesh_id)
-
-
-def _mesh_sparql_query(mesh_ids: Sequence[str]) -> str:
-    values = " ".join(
-        f"<http://id.nlm.nih.gov/mesh/{mesh_id}>"
-        for mesh_id in dict.fromkeys(mesh_ids)
-    )
-    return f"""
-PREFIX meshv: <http://id.nlm.nih.gov/mesh/vocab#>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-
-SELECT ?record
-       (SAMPLE(?recordLabel) AS ?label)
-       (GROUP_CONCAT(DISTINCT STR(?tree); separator="|") AS ?trees)
-       (GROUP_CONCAT(DISTINCT STR(?mapped); separator="|") AS ?mappedIds)
-       (GROUP_CONCAT(DISTINCT STR(?action); separator="|") AS ?actions)
-FROM <http://id.nlm.nih.gov/mesh>
-WHERE {{
-  VALUES ?record {{ {values} }}
-  ?record rdfs:label ?recordLabel .
-  FILTER(LANG(?recordLabel) = "" || LANGMATCHES(LANG(?recordLabel), "en"))
-  OPTIONAL {{ ?record meshv:treeNumber ?tree . }}
-  OPTIONAL {{
-    {{ ?record meshv:mappedTo ?mapped . }}
-    UNION
-    {{ ?record meshv:preferredMappedTo ?mapped . }}
-  }}
-  OPTIONAL {{ ?record meshv:pharmacologicalAction ?action . }}
-}}
-GROUP BY ?record
-""".strip()
-
-
-def _fetch_mesh_records(
-    mesh_ids: Sequence[str],
-    *,
-    session: requests.Session,
-    pacer: RequestPacer,
-    metrics: _RequestMetrics,
-    config: PubTator3Config,
-) -> dict[str, MeshRecord]:
-    """Retrieve MeSH hierarchy data from the official MeSH RDF endpoint.
-
-    Entrez MeSH EFetch commonly returns document-summary XML rather than the
-    full DescriptorRecord/SupplementalRecord XML used in the annual MeSH files.
-    Parsing that response as full records leaves every identifier unresolved.
-    MeSH RDF exposes labels, tree numbers, SCR mappings, and pharmacological
-    actions directly, so it is the authoritative API for this classification.
-    """
-
-    records: dict[str, MeshRecord] = {}
-    candidates = tuple(dict.fromkeys(mesh_ids))
-    for batch in _batched(candidates, 20):
-        batch_records: dict[str, MeshRecord] = {}
-        sparql_error: Exception | None = None
-
-        try:
-            response = _request_bytes(
-                session,
-                pacer,
-                metrics,
-                method="GET",
-                url=MESH_RDF_SPARQL,
-                context="MeSH RDF hormone-classification lookup",
-                config=config,
-                params={
-                    "query": _mesh_sparql_query(batch),
-                    "format": "JSON",
-                    "year": "current",
-                    "limit": "1000",
-                },
-            )
-            try:
-                payload = response.json()
-            except ValueError as exc:
-                raise RuntimeError("MeSH RDF returned invalid JSON.") from exc
-
-            results = payload.get("results") if isinstance(payload, Mapping) else None
-            bindings = (
-                results.get("bindings") if isinstance(results, Mapping) else None
-            )
-            if not isinstance(bindings, list):
-                raise RuntimeError("MeSH RDF returned an invalid SPARQL result.")
-
-            for binding in bindings:
-                if not isinstance(binding, Mapping):
-                    continue
-                mesh_id = _mesh_uri_tail(
-                    _sparql_binding_value(binding, "record")
-                ).upper()
-                if mesh_id not in batch:
-                    continue
-
-                tree_numbers = tuple(
-                    value
-                    for value in _mesh_uri_values(
-                        _sparql_binding_value(binding, "trees")
-                    )
-                    if re.fullmatch(r"[A-Z]\d+(?:\.\d+)*", value)
-                )
-                mapped_descriptor_ids = tuple(
-                    value.upper()
-                    for value in _mesh_uri_values(
-                        _sparql_binding_value(binding, "mappedIds")
-                    )
-                    if re.fullmatch(r"(?i)D\d+", value)
-                )
-                pharmacological_action_ids = tuple(
-                    value.upper()
-                    for value in _mesh_uri_values(
-                        _sparql_binding_value(binding, "actions")
-                    )
-                    if re.fullmatch(r"(?i)D\d+", value)
-                )
-                batch_records[mesh_id] = MeshRecord(
-                    mesh_id=mesh_id,
-                    label=_sparql_binding_value(binding, "label"),
-                    record_type=(
-                        "supplementary"
-                        if mesh_id.startswith("C")
-                        else "descriptor"
-                    ),
-                    tree_numbers=tree_numbers,
-                    mapped_descriptor_ids=mapped_descriptor_ids,
-                    pharmacological_action_ids=pharmacological_action_ids,
-                )
-        except Exception as exc:
-            sparql_error = exc
-            logger.warning(
-                "MeSH RDF SPARQL lookup failed for %s; using direct resource "
-                "lookups: %s",
-                batch,
-                exc,
-            )
-
-        missing = [mesh_id for mesh_id in batch if mesh_id not in batch_records]
-        direct_errors: list[Exception] = []
-        for mesh_id in missing:
-            try:
-                record = _fetch_mesh_record_direct(
-                    mesh_id,
-                    session=session,
-                    pacer=pacer,
-                    metrics=metrics,
-                    config=config,
-                )
-            except Exception as exc:
-                direct_errors.append(exc)
-                logger.warning(
-                    "Direct MeSH RDF lookup failed for %s: %s",
-                    mesh_id,
-                    exc,
-                )
-                continue
-            if record is not None:
-                batch_records[mesh_id] = record
-
-        if (
-            not batch_records
-            and missing
-            and len(direct_errors) == len(missing)
-        ):
-            cause = sparql_error or direct_errors[-1]
-            raise RuntimeError(
-                "MeSH RDF batch and direct identifier lookups both failed."
-            ) from cause
-
-        records.update(batch_records)
-
-    return records
-
-
-def _is_hormone_tree_number(tree_number: str) -> bool:
-    value = _clean_text(tree_number)
-    return value == MESH_HORMONE_TREE_PREFIX or value.startswith(
-        f"{MESH_HORMONE_TREE_PREFIX}."
-    )
-
-
 @dataclass
 class _MeshHormoneResult:
     hormone_ids: set[str] = field(default_factory=set)
@@ -1625,296 +975,296 @@ class _MeshHormoneResult:
     evidence: dict[str, str] = field(default_factory=dict)
     unresolved_ids: set[str] = field(default_factory=set)
     cache_hits: int = 0
-
-
-def _fetch_mesh_records_resiliently(
-    mesh_ids: Sequence[str],
-    *,
-    session: requests.Session,
-    pacer: RequestPacer,
-    metrics: _RequestMetrics,
-    config: PubTator3Config,
-) -> tuple[dict[str, MeshRecord], set[str]]:
-    records: dict[str, MeshRecord] = {}
-    failed: set[str] = set()
-    for batch in _batched(tuple(dict.fromkeys(mesh_ids)), 40):
-        try:
-            records.update(
-                _fetch_mesh_records(
-                    batch,
-                    session=session,
-                    pacer=pacer,
-                    metrics=metrics,
-                    config=config,
-                )
-            )
-        except Exception as exc:
-            logger.warning("MeSH hormone-classification lookup failed for %s: %s", batch, exc)
-            failed.update(batch)
-    return records, failed
+    bundle_entries: int = 0
 
 
 def _classify_mesh_hormones(
     chemical_ids: Sequence[str],
     *,
-    cache: LabelCache,
-    session: requests.Session,
-    pacer: RequestPacer,
-    metrics: _RequestMetrics,
-    config: PubTator3Config,
+    hormone_entries: Sequence[HormoneLexiconEntry],
 ) -> _MeshHormoneResult:
-    candidates = tuple(dict.fromkeys(chemical_ids))
-    result = _MeshHormoneResult()
-    if not candidates:
-        return result
+    """Classify PubTator3 chemicals by exact ID membership in the local bundle.
 
-    classifications = cache.get_hormone_membership(_MESH_HORMONE_CACHE_KIND, candidates)
-    result.cache_hits = len(classifications)
-    missing = [mesh_id for mesh_id in candidates if mesh_id not in classifications]
-    candidate_records, failed = _fetch_mesh_records_resiliently(
-        missing,
-        session=session,
-        pacer=pacer,
-        metrics=metrics,
-        config=config,
-    )
+    The downloaded bundle contains only MeSH descriptor IDs from the biological
+    Hormones tree. Therefore, an ID absent from the bundle is deterministically
+    discarded as a non-hormone; no remote lookup or unresolved retry is needed.
+    """
 
-    resolved_now: dict[str, tuple[bool, str]] = {}
-    descriptor_membership: dict[str, tuple[bool, str]] = {}
-    for mesh_id, record in candidate_records.items():
-        if record.label:
-            result.labels[mesh_id] = record.label
-        if record.record_type != "descriptor":
-            continue
-        hormone_tree = next(
-            (tree for tree in record.tree_numbers if _is_hormone_tree_number(tree)),
-            None,
-        )
-        membership = (
-            (True, f"MeSH hormone tree {hormone_tree}")
-            if hormone_tree
-            else (False, "outside MeSH biological hormone tree D06.472")
-        )
-        classifications[mesh_id] = membership
-        descriptor_membership[mesh_id] = membership
-        resolved_now[mesh_id] = membership
-
-    mapped_ids = tuple(
-        dict.fromkeys(
-            mapped_id
-            for record in candidate_records.values()
-            if record.record_type == "supplementary"
-            for mapped_id in record.mapped_descriptor_ids
-        )
-    )
-    cached_mapped = cache.get_hormone_membership(_MESH_HORMONE_CACHE_KIND, mapped_ids)
-    descriptor_membership.update(cached_mapped)
-    missing_mapped = [
-        mesh_id for mesh_id in mapped_ids if mesh_id not in descriptor_membership
-    ]
-    mapped_records, mapped_failed = _fetch_mesh_records_resiliently(
-        missing_mapped,
-        session=session,
-        pacer=pacer,
-        metrics=metrics,
-        config=config,
-    )
-    failed.update(mapped_failed)
-    mapped_resolved: dict[str, tuple[bool, str]] = {}
-    for mesh_id, record in mapped_records.items():
-        if record.record_type != "descriptor":
-            continue
-        hormone_tree = next(
-            (tree for tree in record.tree_numbers if _is_hormone_tree_number(tree)),
-            None,
-        )
-        membership = (
-            (True, f"MeSH hormone tree {hormone_tree}")
-            if hormone_tree
-            else (False, "outside MeSH biological hormone tree D06.472")
-        )
-        descriptor_membership[mesh_id] = membership
-        mapped_resolved[mesh_id] = membership
-
-    for mesh_id, record in candidate_records.items():
-        if mesh_id in classifications:
-            continue
-        if record.record_type != "supplementary":
-            continue
-        if MESH_HORMONE_DESCRIPTOR_ID in record.pharmacological_action_ids:
-            membership = (
-                True,
-                f"MeSH pharmacological action {MESH_HORMONE_DESCRIPTOR_ID}",
-            )
-        else:
-            mapped = [
-                (mapped_id, descriptor_membership.get(mapped_id))
-                for mapped_id in record.mapped_descriptor_ids
-            ]
-            positive = next(
-                (
-                    mapped_id
-                    for mapped_id, membership in mapped
-                    if membership is not None and membership[0]
-                ),
-                None,
-            )
-            if positive:
-                membership = (True, f"MeSH mapped hormone descriptor {positive}")
-            elif mapped and all(membership is not None for _, membership in mapped):
-                membership = (False, "supplementary concept maps outside D06.472")
-            elif mapped:
-                result.unresolved_ids.add(mesh_id)
-                continue
-            else:
-                membership = (False, "supplementary concept has no hormone mapping")
-        classifications[mesh_id] = membership
-        resolved_now[mesh_id] = membership
-
-    result.unresolved_ids.update(
-        mesh_id
-        for mesh_id in candidates
-        if mesh_id not in classifications
-    )
-    result.unresolved_ids.update(mesh_id for mesh_id in failed if mesh_id in candidates)
-    cache.put_hormone_membership(
-        _MESH_HORMONE_CACHE_KIND, {**mapped_resolved, **resolved_now}
-    )
-
-    for mesh_id, (is_hormone, evidence) in classifications.items():
-        if mesh_id not in candidates or not is_hormone:
+    by_id = {entry.mesh_id: entry for entry in hormone_entries}
+    result = _MeshHormoneResult(bundle_entries=len(by_id))
+    for mesh_id in dict.fromkeys(chemical_ids):
+        entry = by_id.get(mesh_id)
+        if entry is None:
             continue
         result.hormone_ids.add(mesh_id)
-        result.evidence[mesh_id] = evidence
-    positive_labels = {
-        mesh_id: label
-        for mesh_id, label in result.labels.items()
-        if mesh_id in result.hormone_ids and label
-    }
-    cache.put_many("hormone", positive_labels, _HORMONE_LABEL_CACHE_SOURCE)
+        result.labels[mesh_id] = entry.preferred_label
+        result.evidence[mesh_id] = (
+            f"local MeSH hormone descriptor bundle {MESH_HORMONE_TREE_PREFIX}"
+        )
     return result
 
 
-def _resolve_hormone_labels(
-    hormone_ids: Sequence[str],
-    *,
-    session: requests.Session,
-    pacer: RequestPacer,
-    metrics: _RequestMetrics,
-    config: PubTator3Config,
-) -> dict[str, str]:
-    records = _fetch_mesh_records(
-        hormone_ids,
-        session=session,
-        pacer=pacer,
-        metrics=metrics,
-        config=config,
-    )
-    return {
-        mesh_id: record.label
-        for mesh_id, record in records.items()
-        if record.label
-    }
-
-
-def _resolve_labels(
-    concept_ids: Mapping[str, set[str]],
-    *,
-    gene_metadata: Mapping[str, GeneMetadata],
-    label_cache_path: Path,
-    session: requests.Session,
-    pacer: RequestPacer,
-    metrics: _RequestMetrics,
-    config: PubTator3Config,
+def _build_mesh_hormone_metadata(
+    hormone_ids: Iterable[str],
     mesh_labels: Mapping[str, str],
-) -> tuple[dict[tuple[str, str], str], dict[tuple[str, str], str], dict[str, int]]:
-    """Resolve display labels without a second NCBI Gene request."""
+) -> dict[str, HormoneCanonicalMetadata]:
+    """Keep every verified hormone under its authoritative MeSH identifier."""
 
-    labels: dict[tuple[str, str], str] = {}
-    sources: dict[tuple[str, str], str] = {}
-    stats = {
-        "label_cache_hits": 0,
-        "gene_labels_resolved": 0,
-        "hormone_labels_resolved": 0,
-        "label_fallbacks": 0,
+    return {
+        mesh_id: HormoneCanonicalMetadata(
+            mesh_id=mesh_id,
+            preferred_label=_clean_text(mesh_labels.get(mesh_id)),
+        )
+        for mesh_id in sorted(set(hormone_ids))
     }
 
-    for concept_id, metadata in gene_metadata.items():
-        if concept_id not in concept_ids.get("gene", set()):
-            continue
-        symbol = _clean_text(metadata.symbol)
-        if not symbol:
-            continue
-        labels[("gene", concept_id)] = symbol
-        sources[("gene", concept_id)] = "NCBI Gene ESummary"
-        stats["gene_labels_resolved"] += 1
 
-    cache = LabelCache(label_cache_path)
+def _spans_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
+
+
+def _chunk_span_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("base"),
+        row.get("doc_key"),
+        row.get("canonical_id"),
+        row.get("chunk_id"),
+        row.get("section_type"),
+    )
+
+
+def _row_span_identity(row: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    """Return a stable chunk-and-offset identity for exact span comparison."""
+
     try:
-        current_mesh_labels = {
-            concept_id: _clean_text(label)
-            for concept_id, label in mesh_labels.items()
-            if concept_id in concept_ids.get("hormone", set()) and _clean_text(label)
-        }
-        for concept_id, label in current_mesh_labels.items():
-            labels[("hormone", concept_id)] = label
-            sources[("hormone", concept_id)] = "MeSH"
-        cache.put_many("hormone", current_mesh_labels, _HORMONE_LABEL_CACHE_SOURCE)
+        start = int(row.get("start"))
+        end = int(row.get("end"))
+    except (TypeError, ValueError):
+        return None
+    if start < 0 or end <= start:
+        return None
+    return (*_chunk_span_key(row), start, end)
 
-        cached_hormones = cache.get_many(
-            "hormone",
-            concept_ids.get("hormone", set()),
-            source=_HORMONE_LABEL_CACHE_SOURCE,
+
+def _validate_existing_gene_rows(
+    state: _EntryState, chunks: Sequence[Mapping[str, Any]], *,
+    matcher: HgncExactMatcher, hgnc_gene_metadata: MutableMapping[str, HgncRecord],
+    concept_ids: MutableMapping[str, set[str]],
+) -> dict[str, int]:
+    """Validate PubTator spans BEFORE they reserve space against exact recovery.
+
+    Complete approved symbols can
+    correct a conflicting alias-based identity; a clipped or multi-gene span
+    must not suppress correctly spelled IL-2/IL-21 etc. in the source text.
+    """
+    from backend.pipeline.entity_span_rules import gene_surface_key, sanitize_source_annotations
+    stats = {"gene_mentions_rejected_unsafe_source_span": 0,
+             "gene_mentions_corrected_approved_symbol": 0,
+             "gene_mentions_replaced_compound_span": 0}
+    if not state.provisional_path.is_file():
+        return stats
+    by_chunk = {_chunk_span_key(chunk): chunk for chunk in chunks}
+    kept = []
+    changed = False
+    for raw_row in _iter_jsonl(state.provisional_path):
+        row = dict(raw_row)
+        if row.get("entity_type") != "gene":
+            kept.append(row)
+            continue
+        chunk = by_chunk.get(_chunk_span_key(row))
+        if chunk is None or not isinstance(chunk.get("chunk"), str):
+            kept.append(row)
+            continue
+        text = chunk["chunk"]
+        gene_ids = _parse_gene_identifiers(row.get("gene_id"))
+        old_id = gene_ids[0] if gene_ids else ""
+        record = hgnc_gene_metadata.get(old_id)
+        validation = dict(row)
+        if record and not validation.get("matched_term"):
+            surface_key = gene_surface_key(row.get("mention"))
+            for term in (record.symbol, record.name):
+                if surface_key == gene_surface_key(term):
+                    validation["matched_term"] = term
+                    break
+        if not sanitize_source_annotations(text, [validation]):
+            stats["gene_mentions_rejected_unsafe_source_span"] += 1
+            changed = True
+            continue
+        start, end = int(row["start"]), int(row["end"])
+        surface = text[start:end]
+        # An entire compound of fully written gene names is not one gene.
+        # Shared-prefix KIR compounds have already been excluded, not split.
+        whole = matcher.resolve(surface)
+        parts = matcher.find(surface) if whole is None and re.search(r"[,/]|\b(?:and|or)\b", surface) else []
+        if len(parts) > 1:
+            stats["gene_mentions_replaced_compound_span"] += 1
+            changed = True
+            continue
+        approved = matcher.resolve_approved_symbol(surface)
+        if approved and old_id != approved.record.entrez_id:
+            replacement = approved.record
+            row.update({"gene_id": replacement.entrez_id,
+                        "concept_id": replacement.hgnc_id, "normalized_id": replacement.hgnc_id,
+                        "hgnc_id": replacement.hgnc_id, "ncbi_gene_id": f"NCBIGene:{replacement.entrez_id}",
+                        "pubtator_original_gene_id": old_id,
+                        "identity_correction": "whole_approved_symbol_over_conflicting_alias",
+                        "matched_term": approved.matched_term, "term_kind": approved.term_kind,
+                        "resource_version": approved.resource_version, "identified_source": "exact_match",
+                        "tax_id": "9606"})
+            hgnc_gene_metadata[replacement.entrez_id] = replacement
+            concept_ids["gene"].add(replacement.entrez_id)
+            stats["gene_mentions_corrected_approved_symbol"] += 1
+            changed = True
+        kept.append(row)
+    if changed:
+        temporary = state.provisional_path.with_suffix(".source-validation.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                for row in kept:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            os.replace(temporary, state.provisional_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return stats
+
+
+def _append_hgnc_exact_gene_matches(
+    states: Sequence[_EntryState],
+    *,
+    matcher: HgncExactMatcher,
+    concept_ids: MutableMapping[str, set[str]],
+    hgnc_gene_metadata: MutableMapping[str, HgncRecord],
+) -> dict[str, int]:
+    """Add unique exact HGNC mentions that PubTator3 did not identify.
+
+    Source-valid PubTator3 spans reserve space only against equal or shorter
+    exact candidates after approved-symbol identity correction. Clipped/compound spans do not
+    suppress exact recovery. Among fallback
+    candidates, the longest non-overlapping exact term is retained. Verified
+    hormone precedence is applied during finalization, where a gene occupying
+    the exact same span as a retained MeSH hormone is removed.
+    """
+
+    stats = {
+        "hgnc_exact_terms_indexed": matcher.term_count,
+        "hgnc_exact_ambiguous_terms_excluded": matcher.ambiguous_term_count,
+        "hgnc_exact_records_indexed": matcher.record_count,
+        "hgnc_exact_candidates_found": 0,
+        "hgnc_exact_mentions_added": 0,
+        "hgnc_exact_mentions_skipped_existing_gene_overlap": 0,
+        "hgnc_exact_mentions_skipped_fallback_overlap": 0,
+        "hgnc_exact_unique_gene_ids_added": 0,
+        "gene_mentions_rejected_unsafe_source_span": 0,
+        "gene_mentions_corrected_approved_symbol": 0,
+        "gene_mentions_replaced_compound_span": 0,
+    }
+    gene_ids_before = set(hgnc_gene_metadata)
+
+    for state in states:
+        chunks = list(_iter_jsonl(Path(str(state.entry["chunk_path"]))))
+        validation_stats = _validate_existing_gene_rows(state, chunks, matcher=matcher,
+            hgnc_gene_metadata=hgnc_gene_metadata, concept_ids=concept_ids)
+        for key, value in validation_stats.items():
+            stats[key] += value
+        existing_by_chunk: dict[tuple[Any, ...], list[tuple[int, int]]] = (
+            collections.defaultdict(list)
         )
-        for concept_id, label in cached_hormones.items():
-            key = ("hormone", concept_id)
-            if key not in labels:
-                labels[key] = label
-                sources[key] = "MeSH"
-                stats["label_cache_hits"] += 1
+        if state.provisional_path.is_file():
+            for row in _iter_jsonl(state.provisional_path):
+                if str(row.get("entity_type") or "") != "gene":
+                    continue
+                try:
+                    start = int(row.get("start"))
+                    end = int(row.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= start < end:
+                    existing_by_chunk[_chunk_span_key(row)].append((start, end))
 
-        if config.resolve_preferred_labels:
-            missing_hormones = sorted(
-                concept_id
-                for concept_id in concept_ids.get("hormone", set())
-                if ("hormone", concept_id) not in labels
-            )
-            try:
-                resolved_hormones = _resolve_hormone_labels(
-                    missing_hormones,
-                    session=session,
-                    pacer=pacer,
-                    metrics=metrics,
-                    config=config,
+        additions: list[dict[str, Any]] = []
+        for chunk_index in sorted(state.annotatable_chunks):
+            if not (0 <= chunk_index < len(chunks)):
+                continue
+            chunk = chunks[chunk_index]
+            chunk_text = str(chunk.get("chunk") or "")
+            if not chunk_text:
+                continue
+            chunk_key = _chunk_span_key(chunk)
+            existing_spans = list(existing_by_chunk.get(chunk_key, ()))
+            candidates = matcher.find(chunk_text)
+            stats["hgnc_exact_candidates_found"] += len(candidates)
+
+            selected: list[Any] = []
+            for candidate in sorted(
+                candidates,
+                key=lambda item: (
+                    -(item.end - item.start),
+                    item.start,
+                    item.end,
+                    item.record.entrez_id,
+                ),
+            ):
+                span = (candidate.start, candidate.end)
+                if any(_spans_overlap(span, occupied) and
+                       occupied[1] - occupied[0] >= span[1] - span[0]
+                       for occupied in existing_spans):
+                    stats["hgnc_exact_mentions_skipped_existing_gene_overlap"] += 1
+                    continue
+                if any(
+                    _spans_overlap(span, (kept.start, kept.end))
+                    for kept in selected
+                ):
+                    stats["hgnc_exact_mentions_skipped_fallback_overlap"] += 1
+                    continue
+                selected.append(candidate)
+
+            for candidate in sorted(selected, key=lambda item: (item.start, item.end)):
+                gene_id = candidate.record.entrez_id
+                if not gene_id:
+                    continue
+                row = _source_projection(chunk)
+                row.update(
+                    {
+                        "entity_type": "gene",
+                        "start": candidate.start,
+                        "end": candidate.end,
+                        "mention": candidate.mention,
+                        "concept_id": candidate.record.hgnc_id,
+                        "normalized_id": candidate.record.hgnc_id,
+                        "hgnc_id": candidate.record.hgnc_id,
+                        "ncbi_gene_id": f"NCBIGene:{gene_id}",
+                        "gene_id": gene_id,
+                        "normalization_source": "HGNC complete set exact term match",
+                        "matched_term": candidate.matched_term,
+                        "term_kind": candidate.term_kind,
+                        "resource_version": candidate.resource_version,
+                        "source_entity_type": "Gene/Protein",
+                        "identified_source": "exact_match",
+                        "tax_id": "9606",
+                        "taxonomy_source": "HGNC human nomenclature reference",
+                    }
                 )
-            except Exception as exc:
-                logger.warning("MeSH RDF preferred-label lookup failed: %s", exc)
-                resolved_hormones = {}
-            for concept_id, label in resolved_hormones.items():
-                labels[("hormone", concept_id)] = label
-                sources[("hormone", concept_id)] = "MeSH"
-            cache.put_many("hormone", resolved_hormones, _HORMONE_LABEL_CACHE_SOURCE)
-            stats["hormone_labels_resolved"] = len(resolved_hormones)
+                additions.append(row)
+                concept_ids["gene"].add(gene_id)
+                hgnc_gene_metadata.setdefault(gene_id, candidate.record)
+                existing_spans.append((candidate.start, candidate.end))
+                stats["hgnc_exact_mentions_added"] += 1
 
-        stats["label_fallbacks"] = sum(
-            1
-            for entity_type in ("gene", "hormone")
-            for concept_id in concept_ids.get(entity_type, set())
-            if (entity_type, concept_id) not in labels
-        )
-    finally:
-        cache.close()
-    return labels, sources, stats
+        if additions:
+            _append_jsonl(state.provisional_path, additions)
+            state.annotations_written += len(additions)
+
+    stats["hgnc_exact_unique_gene_ids_added"] = len(
+        set(hgnc_gene_metadata) - gene_ids_before
+    )
+    return stats
+
 
 def _finalize_entry(
     state: _EntryState,
     *,
-    labels: Mapping[tuple[str, str], str],
-    label_sources: Mapping[tuple[str, str], str],
-    human_gene_metadata: Mapping[str, GeneMetadata],
-    non_human_gene_ids: set[str],
-    unresolved_gene_ids: set[str],
-    hormone_ids: set[str],
+    hgnc_gene_metadata: Mapping[str, HgncRecord],
+    hormone_metadata: Mapping[str, HormoneCanonicalMetadata],
     hormone_evidence: Mapping[str, str],
     unresolved_hormone_ids: set[str],
 ) -> dict[str, int]:
@@ -1930,13 +1280,28 @@ def _finalize_entry(
         "hormone": 0,
         "total": 0,
         "gene_raw": 0,
-        "gene_non_human_discarded": 0,
-        "gene_unresolved_discarded": 0,
-        "gene_tax_hint_mismatches": 0,
+        "gene_without_hgnc_mapping_discarded": 0,
+        "gene_same_span_hormone_discarded": 0,
+        "gene_mentions_from_pubtator": 0,
+        "gene_mentions_from_hgnc_exact": 0,
+        "gene_mentions_with_uniprot": 0,
         "chemical_raw": 0,
         "chemical_discarded": 0,
         "chemical_unresolved": 0,
+        "hormone_mesh_mentions": 0,
     }
+
+    verified_hormone_spans: set[tuple[Any, ...]] = set()
+    if state.provisional_path.is_file():
+        for raw_row in _iter_jsonl(state.provisional_path):
+            if str(raw_row.get("entity_type") or "") != "chemical":
+                continue
+            identifier = normalize_mesh_id(raw_row.get("chemical_id"))
+            if identifier not in hormone_metadata:
+                continue
+            span_identity = _row_span_identity(raw_row)
+            if span_identity is not None:
+                verified_hormone_spans.add(span_identity)
 
     def rows() -> Iterator[dict[str, Any]]:
         if not state.provisional_path.is_file():
@@ -1945,14 +1310,11 @@ def _finalize_entry(
         for raw_row in _iter_jsonl(state.provisional_path):
             row = dict(raw_row)
             raw_entity_type = str(row.get("entity_type") or "")
-            identifier = str(
-                (
-                    row.get("gene_id")
-                    if raw_entity_type == "gene"
-                    else row.get("chemical_id")
-                )
-                or ""
-            )
+            if raw_entity_type == "gene":
+                gene_ids = _parse_gene_identifiers(row.get("gene_id"))
+                identifier = gene_ids[0] if gene_ids else ""
+            else:
+                identifier = normalize_mesh_id(row.get("chemical_id"))
             raw_signature = (
                 row.get("base"),
                 row.get("chunk_id"),
@@ -1967,57 +1329,103 @@ def _finalize_entry(
 
             if raw_entity_type == "chemical":
                 counts["chemical_raw"] += 1
-                if identifier not in hormone_ids:
+                canonical = hormone_metadata.get(identifier)
+                if canonical is None:
                     counts["chemical_discarded"] += 1
                     if identifier in unresolved_hormone_ids:
                         counts["chemical_unresolved"] += 1
                     continue
-                entity_type = "hormone"
-                row["entity_type"] = entity_type
-                row["hormone_id"] = identifier
-                # Retained for compatibility with code that already consumes MeSH IDs.
+
+                mesh_curie = f"MESH:{identifier}"
+                preferred_label = (
+                    canonical.preferred_label or _clean_text(row.get("mention"))
+                )
+                row["entity_type"] = "hormone"
+                row["source_entity_type"] = (
+                    _clean_text(row.get("source_entity_type")) or "Chemical"
+                )
+                row["source_concept_id"] = mesh_curie
+                row["pubtator_mesh_id"] = identifier
+                row["mesh_id"] = mesh_curie
                 row["chemical_id"] = identifier
-                row["source_entity_type"] = "Chemical"
+                row["concept_id"] = mesh_curie
+                row["normalized_id"] = mesh_curie
+                row["hormone_id"] = mesh_curie
+                row["canonical_id_type"] = "mesh"
+                row["canonical_name"] = preferred_label
+                row["preferred_label"] = preferred_label
+                row["label_source"] = "MeSH"
+                row["normalization_source"] = (
+                    "PubTator3 MeSH chemical -> local MeSH hormone bundle"
+                )
+                row["normalization_status"] = "canonical_mesh_hormone"
                 row["hormone_classification_source"] = hormone_evidence.get(
                     identifier,
-                    "MeSH biological hormone hierarchy D06.472",
+                    "local MeSH hormone descriptor bundle D06.472",
                 )
+                counts["hormone_mesh_mentions"] += 1
+
             elif raw_entity_type == "gene":
                 counts["gene_raw"] += 1
-                metadata = human_gene_metadata.get(identifier)
-                if metadata is None:
-                    if identifier in non_human_gene_ids:
-                        counts["gene_non_human_discarded"] += 1
-                    elif identifier in unresolved_gene_ids:
-                        counts["gene_unresolved_discarded"] += 1
-                    else:
-                        counts["gene_unresolved_discarded"] += 1
+                span_identity = _row_span_identity(row)
+                if span_identity in verified_hormone_spans:
+                    counts["gene_same_span_hormone_discarded"] += 1
                     continue
-                entity_type = "gene"
-                pubtator_tax_id = normalize_tax_id(row.pop("pubtator_tax_id", ""))
-                if pubtator_tax_id and pubtator_tax_id != metadata.tax_id:
-                    counts["gene_tax_hint_mismatches"] += 1
-                row["gene_id"] = metadata.gene_id
-                row["concept_id"] = f"NCBIGene:{metadata.gene_id}"
-                row["tax_id"] = metadata.tax_id
-                row["tax_name"] = metadata.tax_name or HUMAN_TAX_NAME
-                row["taxonomy_source"] = "NCBI Gene ESummary"
-                if metadata.status:
-                    row["gene_record_status"] = metadata.status
+                hgnc = hgnc_gene_metadata.get(identifier)
+                identified_source = _clean_text(row.get("identified_source")).casefold()
+                from_hgnc_exact = identified_source == "exact_match"
+                if hgnc is None:
+                    counts["gene_without_hgnc_mapping_discarded"] += 1
+                    continue
+                # HGNC is a naming reference, not verification of source species.
+                for field in ("tax_id", "tax_name", "tax_ids", "taxonomy_source"):
+                    row.pop(field, None)
+                row["reference_tax_id"] = "9606"
+                row["taxonomy_status"] = "not_validated_hgnc_mapping_only"
+                ncbi_curie = f"NCBIGene:{identifier}"
+                hgnc_curie = hgnc.hgnc_id
+                for legacy_field in (
+                    "gene_id",
+                    "pubtator_gene_id",
+                    "recognition_source",
+                    "hgnc_exact_match_term",
+                    "hgnc_ids",
+                    "UniProt",
+                ):
+                    row.pop(legacy_field, None)
+                row["entity_type"] = "gene"
+                row["source_concept_id"] = ncbi_curie
+                row["source_entity_type"] = "Gene/Protein"
+                if from_hgnc_exact:
+                    counts["gene_mentions_from_hgnc_exact"] += 1
+                    row["identified_source"] = "exact_match"
+                else:
+                    counts["gene_mentions_from_pubtator"] += 1
+                    row["identified_source"] = "pubtator3"
+
+                # Both recognition paths publish the same identity schema.
+                # HGNC is canonical; NCBI Gene and UniProt remain attached
+                # cross-reference metadata from the approved HGNC record.
+                row["ncbi_gene_id"] = ncbi_curie
+                row["hgnc_id"] = hgnc_curie
+                row["concept_id"] = hgnc_curie
+                row["normalized_id"] = hgnc_curie
+                row["canonical_id_type"] = "hgnc"
+                row["canonical_name"] = hgnc.name
+                row["preferred_label"] = hgnc.symbol or _clean_text(row.get("mention"))
+                row["label_source"] = "HGNC"
+                row["normalization_source"] = "approved HGNC complete-set record"
+                row["normalization_status"] = "canonical_hgnc"
+                if hgnc.uniprot_ids:
+                    uniprot_ids = list(hgnc.uniprot_ids)
+                    row["uniprot_ids"] = uniprot_ids
+                    counts["gene_mentions_with_uniprot"] += 1
+                else:
+                    row.pop("uniprot_ids", None)
             else:
                 continue
 
-            key = (entity_type, identifier)
-            preferred_label = _clean_text(labels.get(key))
-            if preferred_label:
-                row["preferred_label"] = preferred_label
-                row["label_source"] = label_sources.get(key) or (
-                    "NCBI Gene" if entity_type == "gene" else "MeSH"
-                )
-            else:
-                row["preferred_label"] = _clean_text(row.get("mention"))
-                row["label_source"] = "mention"
-            counts[entity_type] += 1
+            counts[row["entity_type"]] += 1
             counts["total"] += 1
             yield row
 
@@ -2032,7 +1440,7 @@ def run_pubtator3_annotations(
     options: Mapping[str, Any] | None = None,
     label_cache_path: Path,
 ) -> dict[str, Any]:
-    """Extract genes and MeSH-filtered hormones for every Stage 1 paper entry."""
+    """Extract taxonomy-verified human genes and MeSH-normalized hormones."""
 
     started = time.monotonic()
     config = PubTator3Config.from_options(options)
@@ -2057,7 +1465,9 @@ def run_pubtator3_annotations(
 
         pmid: str | None = None
         pmcid: str | None = None
-        title_abstract_chunks: set[int] = set()
+        text_mode = ""
+        abstract_chunks: set[int] = set()
+        annotatable_chunks: set[int] = set()
         chunk_count = 0
         for chunk_index, chunk in enumerate(_iter_jsonl(Path(str(entry["chunk_path"])))):
             chunk_count += 1
@@ -2065,9 +1475,14 @@ def run_pubtator3_annotations(
                 pmcid = _normalize_pmcid(chunk.get("pmcid"))
             if pmid is None:
                 pmid = _normalize_pmid(chunk.get("pmid"))
+            if not text_mode:
+                text_mode = _clean_text(chunk.get("text_mode")).casefold()
             section = _clean_text(chunk.get("section_type")).upper()
-            if section in {"TITLE", "ABSTRACT"}:
-                title_abstract_chunks.add(chunk_index)
+            chunk_text = _clean_text(chunk.get("chunk"))
+            if section == "ABSTRACT" and chunk_text:
+                abstract_chunks.add(chunk_index)
+            if section not in {"TITLE", "METADATA"} and chunk_text:
+                annotatable_chunks.add(chunk_index)
 
         states.append(
             _EntryState(
@@ -2075,20 +1490,27 @@ def run_pubtator3_annotations(
                 provisional_path=provisional,
                 pmid=pmid,
                 pmcid=pmcid,
+                text_mode=text_mode,
                 chunk_count=chunk_count,
-                title_abstract_chunks=title_abstract_chunks,
+                abstract_chunks=abstract_chunks,
+                annotatable_chunks=annotatable_chunks,
             )
         )
-        if pmcid:
+        # Never request text for a metadata-only paper. Abstract-only jobs use
+        # the PubMed abstract endpoint directly instead of downloading PMC full
+        # text during entity extraction.
+        if pmcid and annotatable_chunks and text_mode != "abstract":
             pmcid_to_states[pmcid].append(index)
-        if pmid:
+        if pmid and abstract_chunks:
             pmid_to_states[pmid].append(index)
-        if pmid and pmcid:
+        if pmid and pmcid and annotatable_chunks and text_mode != "abstract":
             pmid_to_pmcid[pmid] = pmcid
 
     concept_ids: dict[str, set[str]] = {"gene": set(), "chemical": set()}
     stats: dict[str, Any] = {
         "pubtator_pipeline_version": PUBTATOR3_PIPELINE_VERSION,
+        "pubtator_batch_size": config.batch_size,
+        "pubtator_request_method": "GET",
         "pubtator_papers_total": len(states),
         "pubtator_pmcids_requested": len(pmcid_to_states),
         "pubtator_pmids_requested": 0,
@@ -2105,16 +1527,15 @@ def run_pubtator3_annotations(
         pmcids = tuple(pmcid_to_states)
         for batch in _batched(pmcids, config.batch_size):
             try:
-                response = _request_bytes(
+                response = _request_pubtator_export_batch(
                     session,
                     pacer,
                     metrics,
-                    method="GET",
                     url=PUBTATOR3_PMC_EXPORT,
+                    identifier_field="pmcids",
+                    identifiers=batch,
                     context="PubTator3 PMC full-text export",
                     config=config,
-                    params={"pmcids": ",".join(batch)},
-                    accepted_statuses={400, 404},
                 )
                 if response.status_code in {400, 404}:
                     continue
@@ -2145,7 +1566,7 @@ def run_pubtator3_annotations(
         needed_pmids: list[str] = []
         for pmid, state_indexes in pmid_to_states.items():
             if any(
-                states[state_index].title_abstract_chunks
+                states[state_index].abstract_chunks
                 - states[state_index].covered_chunks
                 for state_index in state_indexes
             ):
@@ -2154,16 +1575,15 @@ def run_pubtator3_annotations(
 
         for batch in _batched(tuple(needed_pmids), config.batch_size):
             try:
-                response = _request_bytes(
+                response = _request_pubtator_export_batch(
                     session,
                     pacer,
                     metrics,
-                    method="GET",
                     url=PUBTATOR3_ABSTRACT_EXPORT,
+                    identifier_field="pmids",
+                    identifiers=batch,
                     context="PubTator3 PubMed abstract export",
                     config=config,
-                    params={"pmids": ",".join(batch)},
-                    accepted_statuses={400, 404},
                 )
                 if response.status_code in {400, 404}:
                     continue
@@ -2182,6 +1602,7 @@ def run_pubtator3_annotations(
                         concept_ids=concept_ids,
                         gene_identifier_metrics=gene_identifier_metrics,
                         only_uncovered=True,
+                        allowed_chunk_indexes=states[state_index].abstract_chunks,
                     )
                     stats["pubtator_chunks_matched"] += matched
                     stats["pubtator_annotation_count"] += written
@@ -2194,32 +1615,84 @@ def run_pubtator3_annotations(
                 "Set PUBTATOR3_REQUIRED=false only when a cell-only fallback is acceptable."
             )
 
-        classification_cache = LabelCache(label_cache_path)
-        try:
-            gene_metadata_result = _resolve_human_gene_metadata(
-                sorted(concept_ids["gene"]),
-                cache=classification_cache,
-                session=session,
-                pacer=pacer,
-                metrics=metrics,
-                config=config,
-            )
-            mesh_result = _classify_mesh_hormones(
-                sorted(concept_ids["chemical"]),
-                cache=classification_cache,
-                session=session,
-                pacer=pacer,
-                metrics=metrics,
-                config=config,
-            )
-        finally:
-            classification_cache.close()
+        reference_cache_dir = (
+            Path(config.reference_data_cache_dir).expanduser().resolve()
+            if config.reference_data_cache_dir
+            else label_cache_path.parent / "reference_data"
+        )
+        pubtator_gene_ids = set(concept_ids["gene"])
+        hgnc_reference_status: CachedFileStatus | None = None
+        hgnc_reference_error = ""
+        hgnc_gene_records: dict[str, HgncRecord] = {}
+        hgnc_unresolved_pubtator_gene_ids = set(pubtator_gene_ids)
+        hgnc_multiple_match_ids: set[str] = set()
+        hgnc_exact_stats: dict[str, int] = {
+            "hgnc_exact_terms_indexed": 0,
+            "hgnc_exact_ambiguous_terms_excluded": 0,
+            "hgnc_exact_records_indexed": 0,
+            "hgnc_exact_candidates_found": 0,
+            "hgnc_exact_mentions_added": 0,
+            "hgnc_exact_mentions_skipped_existing_gene_overlap": 0,
+            "hgnc_exact_mentions_skipped_fallback_overlap": 0,
+            "hgnc_exact_unique_gene_ids_added": 0,
+            "gene_mentions_rejected_unsafe_source_span": 0,
+            "gene_mentions_corrected_approved_symbol": 0,
+            "gene_mentions_replaced_compound_span": 0,
+        }
 
-        if config.required and concept_ids["gene"] and not gene_metadata_result.records:
-            raise RuntimeError(
-                "NCBI Gene metadata lookup resolved none of the PubTator3 Gene IDs; "
-                "refusing to publish a zero-gene Stage 2 artifact."
+        # Load the HGNC naming and numeric-ID cross-references.
+        # No species evidence is requested or used as an annotation veto.
+        exact_matcher: HgncExactMatcher | None = None
+        if any(state.annotatable_chunks for state in states):
+            try:
+                hgnc_reference_status = ensure_hgnc_reference(
+                    cache_dir=reference_cache_dir,
+                    session=session,
+                    request_timeout=config.request_timeout,
+                    max_attempts=config.max_attempts,
+                )
+                hgnc_result = resolve_hgnc_by_entrez(
+                    hgnc_reference_status.path,
+                    sorted(pubtator_gene_ids),
+                )
+                hgnc_gene_records.update(hgnc_result.records)
+                hgnc_unresolved_pubtator_gene_ids = hgnc_result.unresolved_ids
+                hgnc_multiple_match_ids = hgnc_result.multiple_match_ids
+                exact_matcher = build_hgnc_exact_matcher(hgnc_reference_status.path)
+            except Exception as exc:
+                hgnc_reference_error = str(exc)
+                logger.warning(
+                    "HGNC reference data unavailable; genes cannot be normalized: %s", exc)
+                raise RuntimeError("The HGNC reference is required for gene normalization.") from exc
+
+        # No species checks: approved HGNC identity is the only gene-ID gate.
+        if exact_matcher is not None:
+            try:
+                hgnc_exact_stats = _append_hgnc_exact_gene_matches(
+                    states, matcher=exact_matcher, concept_ids=concept_ids,
+                    hgnc_gene_metadata=hgnc_gene_records)
+            except Exception:
+                # Do not publish a silently partial result after a local recovery
+                # programming/I/O failure; its traceback identifies the real cause.
+                logger.exception("HGNC exact recovery failed after loading reference data")
+                raise
+
+        hormone_label_cache_hits = 0
+        hormone_labels_fetched = 0
+        try:
+            hormone_entries, hormone_bundle_source = ensure_hormone_lexicon(
+                DEFAULT_HORMONE_LEXICON_PATH
             )
+        except Exception as exc:
+            raise RuntimeError(
+                "The local MeSH hormone bundle could not be loaded from "
+                f"{DEFAULT_HORMONE_LEXICON_PATH}."
+            ) from exc
+
+        mesh_result = _classify_mesh_hormones(
+            sorted(concept_ids["chemical"]),
+            hormone_entries=hormone_entries,
+        )
 
         if (
             config.required
@@ -2231,19 +1704,9 @@ def run_pubtator3_annotations(
                 "identifier; refusing to publish an unverified hormone result."
             )
 
-        final_concept_ids: dict[str, set[str]] = {
-            "gene": set(gene_metadata_result.human_records),
-            "hormone": set(mesh_result.hormone_ids),
-        }
-        labels, label_sources, label_stats = _resolve_labels(
-            final_concept_ids,
-            gene_metadata=gene_metadata_result.human_records,
-            label_cache_path=label_cache_path,
-            session=session,
-            pacer=pacer,
-            metrics=metrics,
-            config=config,
-            mesh_labels=mesh_result.labels,
+        hormone_metadata = _build_mesh_hormone_metadata(
+            mesh_result.hormone_ids,
+            mesh_result.labels,
         )
 
         final_counts = {
@@ -2251,94 +1714,138 @@ def run_pubtator3_annotations(
             "hormone": 0,
             "total": 0,
             "gene_raw": 0,
-            "gene_non_human_discarded": 0,
-            "gene_unresolved_discarded": 0,
-            "gene_tax_hint_mismatches": 0,
+            "gene_without_hgnc_mapping_discarded": 0,
+            "gene_same_span_hormone_discarded": 0,
+            "gene_mentions_from_pubtator": 0,
+            "gene_mentions_from_hgnc_exact": 0,
+            "gene_mentions_with_uniprot": 0,
             "chemical_raw": 0,
             "chemical_discarded": 0,
             "chemical_unresolved": 0,
+            "hormone_mesh_mentions": 0,
         }
         for state in states:
             entry_counts = _finalize_entry(
                 state,
-                labels=labels,
-                label_sources=label_sources,
-                human_gene_metadata=gene_metadata_result.human_records,
-                non_human_gene_ids=gene_metadata_result.non_human_ids,
-                unresolved_gene_ids=gene_metadata_result.unresolved_ids,
-                hormone_ids=mesh_result.hormone_ids,
+                hgnc_gene_metadata=hgnc_gene_records,
+                hormone_metadata=hormone_metadata,
                 hormone_evidence=mesh_result.evidence,
                 unresolved_hormone_ids=mesh_result.unresolved_ids,
             )
             for key in final_counts:
                 final_counts[key] += int(entry_counts[key])
 
+        hgnc_reference_stats: dict[str, Any] = {
+            "hgnc_reference_files": 0,
+            "hgnc_reference_files_downloaded": 0,
+            "hgnc_reference_stale_files_used": 0,
+            "hgnc_reference_bytes": 0,
+            "hgnc_reference_error": hgnc_reference_error,
+        }
+        if hgnc_reference_status is not None:
+            hgnc_reference_stats.update(
+                reference_download_stats((hgnc_reference_status,), prefix="hgnc")
+            )
+
         stats["pubtator_annotation_count"] = final_counts["total"]
-        stats["pubtator_papers_covered"] = sum(1 for state in states if state.document_seen)
+        eligible_states = [state for state in states if state.annotatable_chunks]
+        stats["pubtator_papers_eligible"] = len(eligible_states)
+        stats["pubtator_papers_without_text"] = len(states) - len(eligible_states)
+        stats["pubtator_papers_covered"] = sum(
+            1 for state in eligible_states if state.document_seen
+        )
         stats["pubtator_papers_uncovered"] = (
-            len(states) - int(stats["pubtator_papers_covered"])
+            len(eligible_states) - int(stats["pubtator_papers_covered"])
         )
-        total_chunks = sum(state.chunk_count for state in states)
+        source_rows = sum(state.chunk_count for state in states)
+        eligible_chunks = sum(len(state.annotatable_chunks) for state in states)
         covered_chunks = sum(len(state.covered_chunks) for state in states)
-        stats["pubtator_chunks_total"] = total_chunks
+        stats["pubtator_source_rows_total"] = source_rows
+        stats["pubtator_chunks_total"] = eligible_chunks
+        stats["pubtator_chunks_without_text"] = max(0, source_rows - eligible_chunks)
         stats["pubtator_chunks_covered"] = covered_chunks
-        stats["pubtator_chunks_uncovered"] = max(0, total_chunks - covered_chunks)
+        stats["pubtator_chunks_uncovered"] = max(0, eligible_chunks - covered_chunks)
+
         stats["gene_mentions"] = final_counts["gene"]
-        stats["hormone_count"] = final_counts["hormone"]
-        stats["pubtator_gene_mentions_raw"] = final_counts["gene_raw"]
-        stats["raw_unique_gene_ids"] = len(concept_ids["gene"])
-        stats["unique_gene_ids"] = len(gene_metadata_result.human_records)
-        stats["human_tax_id"] = HUMAN_TAX_ID
+        stats["gene_mentions_from_pubtator"] = final_counts[
+            "gene_mentions_from_pubtator"
+        ]
+        stats["gene_mentions_from_hgnc_exact_match"] = final_counts[
+            "gene_mentions_from_hgnc_exact"
+        ]
+        stats["pubtator_gene_mentions_raw"] = (
+            final_counts["gene_raw"] - final_counts["gene_mentions_from_hgnc_exact"]
+        )
+        stats["pubtator_raw_unique_gene_ids"] = len(pubtator_gene_ids)
+        stats["unique_hgnc_gene_ids"] = len(
+            {record.hgnc_id for record in hgnc_gene_records.values()}
+        )
+        stats["unique_ncbi_gene_ids"] = len(hgnc_gene_records)
+        stats["pubtator_gene_ids_matched_by_hgnc_entrez"] = len(
+            set(pubtator_gene_ids) & set(hgnc_gene_records)
+        )
+        stats["pubtator_gene_ids_without_hgnc_entrez_match"] = len(
+            hgnc_unresolved_pubtator_gene_ids
+        )
+        stats["pubtator_gene_ids_with_multiple_hgnc_rows_retained"] = len(
+            hgnc_multiple_match_ids
+        )
+        stats["gene_mentions_without_hgnc_mapping_discarded"] = final_counts[
+            "gene_without_hgnc_mapping_discarded"
+        ]
+        stats["gene_mentions_removed_for_same_span_mesh_hormone"] = final_counts[
+            "gene_same_span_hormone_discarded"
+        ]
+        stats["gene_mentions_with_uniprot"] = final_counts[
+            "gene_mentions_with_uniprot"
+        ]
+        stats["unique_gene_uniprot_ids"] = len(
+            {
+                accession
+                for record in hgnc_gene_records.values()
+                for accession in record.uniprot_ids
+            }
+        )
+        stats["gene_reference_filter"] = "approved HGNC mapping required; no species validation"
+        stats["gene_taxonomy_validation"] = False
         stats["gene_identifiers_parsed"] = gene_identifier_metrics.parsed_identifiers
-        stats["gene_identifiers_with_pubtator_tax_id"] = (
-            gene_identifier_metrics.scoped_identifiers
-        )
-        stats["gene_identifiers_without_pubtator_tax_id"] = (
-            gene_identifier_metrics.unscoped_identifiers
-        )
         stats["invalid_gene_identifiers_discarded"] = (
             gene_identifier_metrics.invalid_identifiers
         )
-        stats["gene_metadata_cache_hits"] = gene_metadata_result.cache_hits
-        stats["gene_metadata_records_resolved"] = len(gene_metadata_result.records)
-        stats["human_gene_ids_retained"] = len(gene_metadata_result.human_records)
-        stats["non_human_gene_ids_discarded"] = len(
-            gene_metadata_result.non_human_ids
-        )
-        stats["unresolved_gene_ids_discarded"] = len(
-            gene_metadata_result.unresolved_ids
-        )
-        stats["non_human_gene_mentions_discarded"] = final_counts[
-            "gene_non_human_discarded"
-        ]
-        stats["unresolved_gene_mentions_discarded"] = final_counts[
-            "gene_unresolved_discarded"
-        ]
-        stats["pubtator_gene_tax_hint_mismatches"] = final_counts[
-            "gene_tax_hint_mismatches"
-        ]
-        # Compatibility aliases for summaries created by the earlier filter.
-        stats["human_gene_identifiers_retained"] = len(
-            gene_metadata_result.human_records
-        )
-        stats["non_human_gene_identifiers_discarded"] = len(
-            gene_metadata_result.non_human_ids
-        )
-        stats["unscoped_gene_identifiers_discarded"] = 0
-        stats["unverified_gene_mentions_discarded"] = final_counts[
-            "gene_unresolved_discarded"
-        ]
-        stats["unique_hormone_ids"] = len(mesh_result.hormone_ids)
+        stats.update(hgnc_exact_stats)
+
+        stats["hormone_count"] = final_counts["hormone"]
+        stats["unique_hormone_mesh_ids"] = len(mesh_result.hormone_ids)
         stats["pubtator_chemical_mentions_raw"] = final_counts["chemical_raw"]
-        stats["non_hormone_chemical_mentions_discarded"] = final_counts[
+        stats["chemical_mentions_not_retained_as_hormones"] = final_counts[
             "chemical_discarded"
         ]
         stats["unresolved_hormone_chemical_mentions_discarded"] = final_counts[
             "chemical_unresolved"
         ]
-        stats["hormone_mesh_classification_cache_hits"] = mesh_result.cache_hits
+        stats["hormone_mentions_with_mesh_id"] = final_counts[
+            "hormone_mesh_mentions"
+        ]
+        stats["hormone_mesh_classification_cache_hits"] = 0
+        stats["hormone_mesh_bundle_source"] = hormone_bundle_source
+        stats["hormone_mesh_bundle_path"] = str(DEFAULT_HORMONE_LEXICON_PATH)
+        stats["hormone_mesh_bundle_entries"] = mesh_result.bundle_entries
+        stats["hormone_mesh_bundle_matches"] = len(mesh_result.hormone_ids)
+        stats["hormone_mesh_resource_version"] = MESH_HORMONE_RESOURCE_VERSION
         stats["unresolved_hormone_mesh_ids"] = len(mesh_result.unresolved_ids)
-        stats.update(label_stats)
+        stats["hormone_identifier_policy"] = (
+            "MeSH descriptor ID must occur in the local D06.472 hormone bundle"
+        )
+        stats["label_cache_hits"] = hormone_label_cache_hits
+        stats["gene_labels_resolved"] = len(hgnc_gene_records)
+        stats["hormone_labels_resolved"] = sum(
+            1 for item in hormone_metadata.values() if item.preferred_label
+        )
+        stats["hormone_labels_fetched"] = hormone_labels_fetched
+        stats["label_fallbacks"] = sum(
+            1 for item in hormone_metadata.values() if not item.preferred_label
+        )
+        stats.update(hgnc_reference_stats)
         stats["pubtator_requests"] = metrics.requests
         stats["pubtator_retries"] = metrics.retries
         stats["pubtator_failed_requests"] = metrics.failed_requests
@@ -2349,8 +1856,6 @@ def run_pubtator3_annotations(
 
 
 __all__ = [
-    "HUMAN_TAX_ID",
-    "HUMAN_TAX_NAME",
     "MESH_HORMONE_DESCRIPTOR_ID",
     "MESH_HORMONE_TREE_PREFIX",
     "PUBTATOR3_ANNOTATIONS_FILENAME",

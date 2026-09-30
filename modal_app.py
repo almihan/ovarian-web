@@ -2,19 +2,91 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import modal
+from dotenv import load_dotenv
 
-APP_NAME = "ovarian-cellexlink"
-MODEL_VOLUME_NAME = "ovarian-cellexlink-model-cache"
+from backend import deployment_flags
+
+# Loading the local .env is convenient for ``modal deploy``.  The file is
+# ignored by Git and is never added to the Modal image.
+load_dotenv()
+
+APP_NAME = (
+    os.getenv("MODAL_APP_NAME") or "ovarian-cellexlink-hgnc-chebi"
+).strip()
+MODEL_VOLUME_NAME = (
+    os.getenv("MODAL_MODEL_VOLUME_NAME")
+    or "ovarian-cellexlink-hgnc-chebi-model-cache"
+).strip()
+
+
+def _enabled(value: str | None, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+MONTHLY_SCHEDULE_ENABLED = _enabled(
+    os.getenv("MODAL_MONTHLY_SCHEDULE_ENABLED"),
+    deployment_flags.MODAL_MONTHLY_SCHEDULE_ENABLED,
+)
+MONTHLY_CRON = os.getenv("MODAL_MONTHLY_CRON") or deployment_flags.MONTHLY_UPDATE_CRON
+MONTHLY_SECRET_NAME = os.getenv("MODAL_MONTHLY_SECRET_NAME") or "ovarian-monthly-update"
 
 app = modal.App(APP_NAME)
 model_cache_volume = modal.Volume.from_name(
     MODEL_VOLUME_NAME,
     create_if_missing=True,
 )
+
+# This scheduled function only sends an authenticated trigger to Railway.
+# It has no GPU. Railway performs ID discovery and submits the existing GPU
+# worker only after it has identified genuinely new eligible papers.
+schedule_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .uv_pip_install("requests>=2.32,<3")
+    .env({"MODAL_MONTHLY_SCHEDULE_ENABLED": "true" if MONTHLY_SCHEDULE_ENABLED else "false"})
+    .add_local_file("backend/__init__.py", remote_path="/root/backend/__init__.py")
+    .add_local_file("backend/deployment_flags.py", remote_path="/root/backend/deployment_flags.py")
+)
+
+
+@app.function(
+    image=schedule_image,
+    schedule=modal.Cron(MONTHLY_CRON, timezone="UTC") if MONTHLY_SCHEDULE_ENABLED else None,
+    secrets=[modal.Secret.from_name(MONTHLY_SECRET_NAME)] if MONTHLY_SCHEDULE_ENABLED else [],
+    cpu=0.25,
+    memory=256,
+    timeout=120,
+    max_containers=1,
+    scaledown_window=5,
+)
+def monthly_update_trigger() -> dict[str, Any]:
+    """Trigger one budget-limited monthly update; disabled by default."""
+    if os.getenv("MODAL_MONTHLY_SCHEDULE_ENABLED", "false").casefold() != "true":
+        return {"status": "disabled"}
+    import requests
+    from urllib.parse import urlsplit
+
+    base_url = (os.getenv("CORPUS_UPDATE_BASE_URL") or "").strip().rstrip("/")
+    token = (os.getenv("MONTHLY_UPDATE_TOKEN") or "").strip()
+    if urlsplit(base_url).scheme != "https" or not urlsplit(base_url).netloc:
+        raise RuntimeError("CORPUS_UPDATE_BASE_URL must be your HTTPS Railway URL.")
+    if not token:
+        raise RuntimeError("MONTHLY_UPDATE_TOKEN is missing from the Modal update secret.")
+    response = requests.post(
+        f"{base_url}/api/internal/corpus-updates",
+        headers={"X-Corpus-Update-Token": token},
+        json={"dry_run": False},
+        timeout=(10, 60),
+    )
+    response.raise_for_status()
+    result = response.json()
+    return result if isinstance(result, dict) else {"status": "accepted"}
 
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -31,6 +103,8 @@ download_image = (
             "PYTHONUNBUFFERED": "1",
         }
     )
+    .add_local_file("backend/__init__.py", remote_path="/root/backend/__init__.py")
+    .add_local_file("backend/deployment_flags.py", remote_path="/root/backend/deployment_flags.py")
 )
 
 worker_image = (

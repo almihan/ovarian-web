@@ -1,4 +1,4 @@
-"""Shared default Stage 1 cache and run-scoped Stage 1 additions."""
+"""Shared default Stage 1 cache and isolated run-scoped paper selections."""
 
 from __future__ import annotations
 
@@ -18,9 +18,13 @@ from backend.pipeline.retrieval import (
     DEFAULT_PMIDS,
     DEFAULT_PMCIDS,
     DEFAULT_PUBMED_QUERY,
+    CHUNK_OUTPUT_VERSION,
     FULLTEXT_RETRIEVER_VERSION,
     INPUT_PARSER_VERSION,
+    RetrievalError,
     RetrievalResult,
+    TextMode,
+    normalize_text_mode,
     run_paper_retrieval,
 )
 from backend.storage.artifacts import (
@@ -35,13 +39,22 @@ from backend.storage.bundles import build_deterministic_gzip_bundle
 Progress = Callable[[str, int, str, dict[str, Any]], None]
 _ONE_MIB = 1024 * 1024
 _DEFAULT_STAGE1_LOCK = threading.Lock()
-_DEFAULT_STAGE1_KEY = prefixed_key("shared-default/stage1/chunks.jsonl.gz")
-_DEFAULT_STAGE1_SUMMARY_KEY = prefixed_key("shared-default/stage1/summary.json")
 
 
-def default_stage1_signature() -> str:
+def _default_stage1_keys(text_mode: TextMode) -> tuple[str, str]:
+    mode = normalize_text_mode(text_mode)
+    return (
+        prefixed_key(f"shared-default/stage1/{mode}/chunks.jsonl.gz"),
+        prefixed_key(f"shared-default/stage1/{mode}/summary.json"),
+    )
+
+
+def default_stage1_signature(text_mode: TextMode = "fulltext") -> str:
+    mode = normalize_text_mode(text_mode)
     payload = {
-        "cache_schema": "shared-default-stage1-v2",
+        "cache_schema": "shared-default-stage1-v4-final-export",
+        "chunk_output_version": CHUNK_OUTPUT_VERSION,
+        "text_mode": mode,
         "input_parser": INPUT_PARSER_VERSION,
         "fulltext_retriever": FULLTEXT_RETRIEVER_VERSION,
         "query": DEFAULT_PUBMED_QUERY,
@@ -94,16 +107,21 @@ def _paper_index(corpus_path: Path) -> list[dict[str, str]]:
     return records
 
 
-def _cached_default_stage1(store: ArtifactStore) -> dict[str, Any] | None:
-    summary_ref = store.head(_DEFAULT_STAGE1_SUMMARY_KEY)
-    artifact_ref = store.head(_DEFAULT_STAGE1_KEY)
+def _cached_default_stage1(
+    store: ArtifactStore,
+    text_mode: TextMode,
+) -> dict[str, Any] | None:
+    mode = normalize_text_mode(text_mode)
+    artifact_key, summary_key = _default_stage1_keys(mode)
+    summary_ref = store.head(summary_key)
+    artifact_ref = store.head(artifact_key)
     if summary_ref is None or artifact_ref is None:
         return None
     try:
-        summary = store.read_json(_DEFAULT_STAGE1_SUMMARY_KEY)
+        summary = store.read_json(summary_key)
     except Exception:
         return None
-    if summary.get("cache_signature") != default_stage1_signature():
+    if summary.get("cache_signature") != default_stage1_signature(mode):
         return None
     files = summary.get("files")
     files = files if isinstance(files, Mapping) else {}
@@ -119,22 +137,33 @@ def _cached_default_stage1(store: ArtifactStore) -> dict[str, Any] | None:
         "summary": summary,
         "stats": dict(summary.get("stats") or {}),
         "paper_index": paper_index,
+        "text_mode": mode,
         "reused": True,
     }
 
 
-def get_or_build_default_stage1(progress: Progress | None = None) -> dict[str, Any]:
+def get_or_build_default_stage1(
+    progress: Progress | None = None,
+    *,
+    text_mode: TextMode = "fulltext",
+) -> dict[str, Any]:
+    mode = normalize_text_mode(text_mode)
+    artifact_key, summary_key = _default_stage1_keys(mode)
     store = get_artifact_store()
-    cached = _cached_default_stage1(store)
+    cached = _cached_default_stage1(store, mode)
     if cached is not None:
         return cached
 
     with _DEFAULT_STAGE1_LOCK:
-        cached = _cached_default_stage1(store)
+        cached = _cached_default_stage1(store, mode)
         if cached is not None:
             return cached
 
-        work_root = settings.data_dir / "work" / f"default-stage1-{uuid.uuid4().hex}"
+        work_root = (
+            settings.data_dir
+            / "work"
+            / f"default-stage1-{mode}-{uuid.uuid4().hex}"
+        )
         papers_root = work_root / "papers"
         bundle_path = work_root / "chunks.jsonl.gz"
         summary_path = work_root / "summary.json"
@@ -152,6 +181,7 @@ def get_or_build_default_stage1(progress: Progress | None = None) -> dict[str, A
                 batch_size=settings.retrieval_batch_size,
                 request_timeout=settings.retrieval_request_timeout,
                 progress_callback=progress,
+                text_mode=mode,
             )
             line_count = build_deterministic_gzip_bundle(
                 result.chunk_paths,
@@ -159,7 +189,7 @@ def get_or_build_default_stage1(progress: Progress | None = None) -> dict[str, A
             )
             artifact_ref, _ = store.put_file(
                 bundle_path,
-                key=_DEFAULT_STAGE1_KEY,
+                key=artifact_key,
                 content_type="application/gzip",
                 sha256=sha256_file(bundle_path),
             )
@@ -172,7 +202,8 @@ def get_or_build_default_stage1(progress: Progress | None = None) -> dict[str, A
             summary = {
                 "status": "completed",
                 "cache_scope": "shared_default_only",
-                "cache_signature": default_stage1_signature(),
+                "cache_signature": default_stage1_signature(mode),
+                "text_mode": mode,
                 "stats": dict(result.stats),
                 "paper_index": paper_index,
                 "input": source_summary.get("input", {}),
@@ -186,7 +217,7 @@ def get_or_build_default_stage1(progress: Progress | None = None) -> dict[str, A
             _write_json(summary_path, summary)
             store.put_file(
                 summary_path,
-                key=_DEFAULT_STAGE1_SUMMARY_KEY,
+                key=summary_key,
                 content_type="application/json",
                 sha256=sha256_file(summary_path),
             )
@@ -195,6 +226,7 @@ def get_or_build_default_stage1(progress: Progress | None = None) -> dict[str, A
                 "summary": summary,
                 "stats": dict(result.stats),
                 "paper_index": paper_index,
+                "text_mode": mode,
                 "reused": False,
             }
         finally:
@@ -207,7 +239,9 @@ def build_custom_stage1(
     query: str,
     baseline: Mapping[str, Any],
     progress: Progress | None = None,
+    text_mode: TextMode = "fulltext",
 ) -> dict[str, Any] | None:
+    mode = normalize_text_mode(text_mode)
     paper_index = baseline.get("paper_index")
     paper_index = paper_index if isinstance(paper_index, list) else []
     exclude_pmids = [
@@ -247,6 +281,7 @@ def build_custom_stage1(
             exclude_pmids=exclude_pmids,
             exclude_pmcids=exclude_pmcids,
             exclude_canonical_ids=exclude_canonical,
+            text_mode=mode,
         )
         if not result.chunk_paths or int(result.stats.get("paper_count") or 0) == 0:
             return None
@@ -262,6 +297,77 @@ def build_custom_stage1(
             "artifact": artifact_ref.to_dict(),
             "stats": dict(result.stats),
             "record_count": line_count,
+            "text_mode": mode,
+            "reused": False,
+        }
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+
+
+def build_isolated_pmid_stage1(
+    *,
+    run_id: str,
+    query: str,
+    progress: Progress | None = None,
+    text_mode: TextMode = "fulltext",
+) -> dict[str, Any]:
+    """Build a run-scoped Stage 1 artifact from entered PMIDs only.
+
+    This path deliberately skips the reusable default artifact, the built-in
+    PubMed query, and all default identifiers. The returned bundle therefore
+    contains only papers selected by the comma-separated PMID list.
+    """
+
+    mode = normalize_text_mode(text_mode)
+    work_root = settings.data_dir / "work" / f"run-{run_id}-stage1"
+    papers_root = work_root / "papers"
+    bundle_path = work_root / "chunks.jsonl.gz"
+    shutil.rmtree(work_root, ignore_errors=True)
+    work_root.mkdir(parents=True, exist_ok=True)
+    try:
+        result: RetrievalResult = run_paper_retrieval(
+            job_id=run_id,
+            input_type="pmid",
+            user_input=query,
+            papers_root=papers_root,
+            ncbi_email=settings.ncbi_email,
+            ncbi_tool=settings.ncbi_tool,
+            ncbi_api_key=settings.ncbi_api_key,
+            keyword_limit=settings.retrieval_keyword_limit,
+            batch_size=settings.retrieval_batch_size,
+            request_timeout=settings.retrieval_request_timeout,
+            progress_callback=progress,
+            selection_mode="explicit_pmids_only",
+            text_mode=mode,
+        )
+        if not result.chunk_paths or int(result.stats.get("paper_count") or 0) == 0:
+            raise RetrievalError(
+                (
+                    "The entered PMIDs did not produce any usable abstract chunks. "
+                    "Check that the papers have abstracts and try again."
+                    if mode == "abstract"
+                    else (
+                        "The entered PMIDs did not produce any usable title, "
+                        "abstract, or full-text chunks. Check the identifiers and "
+                        "try again."
+                    )
+                )
+            )
+
+        line_count = build_deterministic_gzip_bundle(result.chunk_paths, bundle_path)
+        key = prefixed_key(f"runs/{run_id}/stage1/chunks.jsonl.gz")
+        artifact_ref, _ = get_artifact_store().put_file(
+            bundle_path,
+            key=key,
+            content_type="application/gzip",
+            sha256=sha256_file(bundle_path),
+        )
+        return {
+            "artifact": artifact_ref.to_dict(),
+            "stats": dict(result.stats),
+            "record_count": line_count,
+            "selection_mode": "explicit_pmids_only",
+            "text_mode": mode,
             "reused": False,
         }
     finally:
@@ -334,6 +440,7 @@ def cached_json_pair(
 
 __all__ = [
     "build_custom_stage1",
+    "build_isolated_pmid_stage1",
     "cached_json_pair",
     "default_stage1_signature",
     "get_or_build_default_stage1",

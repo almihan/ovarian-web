@@ -21,6 +21,12 @@ class ModalPollResult:
 
 
 class ModalAnnotationExecutor:
+    def cancel(self, call_id: str) -> None:
+        """Ask Modal to terminate this input without provider retries."""
+        import modal
+
+        modal.FunctionCall.from_id(str(call_id)).cancel()
+
     def _function(self):
         import modal
 

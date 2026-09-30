@@ -1,0 +1,215 @@
+--- a/backend/pipeline/relation_extraction.py
++++ b/backend/pipeline/relation_extraction.py
+@@ -619,9 +619,21 @@
+     parsed: Any,
+     *,
+     entities: Mapping[str, Mapping[str, Any]],
+-    max_triples: int = 50,
++    max_triples: int | None = None,
+ ) -> list[dict[str, str]]:
+-    """Validate model triples and return subject-predicate-object records."""
++    """Validate, deduplicate, and sort every returned triple without truncation.
++
++    There is no count limit by default. An explicit ``max_triples`` is a guard
++    on valid unique triples, not a slice: overflow raises instead of silently
++    choosing a subset based on the model's output order.
++    """
++
++    if max_triples is not None and (
++        isinstance(max_triples, bool)
++        or not isinstance(max_triples, int)
++        or max_triples < 0
++    ):
++        raise ValueError("max_triples must be None or a non-negative integer.")
+ 
+     if not isinstance(parsed, Mapping):
+         raise ValueError("The model response is not a JSON object.")
+@@ -632,7 +644,7 @@
+     allowed_ids = set(entities)
+     cleaned: list[dict[str, str]] = []
+     seen: set[tuple[str, str, str]] = set()
+-    for raw in raw_triples[:max_triples]:
++    for raw in raw_triples:
+         if not isinstance(raw, Mapping):
+             continue
+         subject = str(raw.get("subject") or "").strip()
+@@ -664,6 +676,12 @@
+             int(row["object"][1:]),
+         )
+     )
++    if max_triples is not None and len(cleaned) > max_triples:
++        raise ValueError(
++            f"The model response contains {len(cleaned)} valid unique triples, "
++            f"exceeding max_triples={max_triples}. "
++            "Refusing to discard relations silently."
++        )
+     return cleaned
+ 
+ 
+--- a/backend/services/relation_executor.py
++++ b/backend/services/relation_executor.py
+@@ -61,7 +61,7 @@
+ 
+ 
+ class RelationResponseError(RuntimeError):
+-    """A completed response that could not be accepted locally."""
++    """An API response that could not be accepted as a valid extraction."""
+ 
+     def __init__(
+         self,
+@@ -245,6 +245,9 @@
+ 
+ 
+ def _response_refusal(body: Mapping[str, Any]) -> str | None:
++    top_level = body.get("refusal")
++    if isinstance(top_level, str) and top_level.strip():
++        return top_level.strip()
+     output = body.get("output")
+     if not isinstance(output, list):
+         return None
+@@ -260,7 +263,86 @@
+             refusal = part.get("refusal")
+             if isinstance(refusal, str) and refusal.strip():
+                 return refusal.strip()
++            # The refusal content type itself must not be accepted as success,
++            # even if a provider omitted the explanatory text.
++            return "The response contains a refusal without explanatory text."
+     return None
++
++
++def _validate_response_complete(
++    body: Mapping[str, Any],
++    *,
++    usage: Mapping[str, int],
++) -> None:
++    """Reject incomplete/error/refused responses before reading any JSON text.
++
++    A parseable output_text is not evidence of a completed response. Preserve
++    usage and the incomplete reason so existing retry/accounting logic still
++    handles token-limit failures without treating them as empty extractions.
++    """
++
++    response_id = str(body.get("id") or "unknown")
++    status = str(body.get("status") or "").strip().casefold()
++    incomplete_details = body.get("incomplete_details")
++    error = body.get("error")
++    incomplete_reason = None
++    if isinstance(incomplete_details, Mapping):
++        value = incomplete_details.get("reason")
++        incomplete_reason = str(value or "").strip().casefold() or None
++    error_code = None
++    if isinstance(error, Mapping):
++        error_code = str(error.get("code") or "").strip().casefold() or None
++
++    if status != "completed":
++        reason = incomplete_reason or error_code or status or "missing_status"
++        raise RelationResponseError(
++            f"OpenAI response {response_id} is not completed: "
++            f"status={status or 'missing'!r}; "
++            f"incomplete_details={incomplete_details!r}; error={error!r}.",
++            usage=usage,
++            retryable=reason not in {"content_filter", "refusal"},
++            reason=reason,
++        )
++
++    # Reject contradictory completion metadata rather than trusting the text.
++    if error is not None or incomplete_details is not None:
++        reason = incomplete_reason or error_code or "invalid_completion_metadata"
++        raise RelationResponseError(
++            f"OpenAI response {response_id} reports completed but includes "
++            f"incomplete_details={incomplete_details!r}; error={error!r}.",
++            usage=usage,
++            retryable=reason not in {"content_filter", "refusal"},
++            reason=reason,
++        )
++
++    output = body.get("output")
++    if isinstance(output, list):
++        for item in output:
++            if not isinstance(item, Mapping):
++                continue
++            item_status = item.get("status")
++            # Status is optional on some output item types. When supplied,
++            # a non-completed item must not contribute partial JSON.
++            if (
++                item_status is not None
++                and str(item_status).strip().casefold() != "completed"
++            ):
++                raise RelationResponseError(
++                    f"OpenAI response {response_id} contains an unfinished output "
++                    f"item {item.get('id') or 'unknown'}: status={item_status!r}.",
++                    usage=usage,
++                    retryable=True,
++                    reason="incomplete_output_item",
++                )
++
++    refusal = _response_refusal(body)
++    if refusal is not None:
++        raise RelationResponseError(
++            f"OpenAI refused the relation request (response {response_id}): {refusal}",
++            usage=usage,
++            retryable=False,
++            reason="refusal",
++        )
+ 
+ 
+ def _status_code(exc: BaseException) -> int | None:
+@@ -397,37 +479,22 @@
+         response = await self.client.responses.create(**body)
+         payload = _model_dict(response)
+         usage = _usage_from_response(payload)
+-        status = str(
+-            getattr(response, "status", None) or payload.get("status") or ""
+-        ).casefold()
+-        if status == "incomplete":
+-            incomplete_details = payload.get("incomplete_details")
+-            incomplete_reason = None
+-            if isinstance(incomplete_details, Mapping):
+-                value = incomplete_details.get("reason")
+-                if value is not None:
+-                    incomplete_reason = str(value).strip().casefold() or None
++        # model_dump() normally includes status; keep compatibility with SDK
++        # response-like objects that expose it only as an attribute.
++        if payload.get("status") is None:
++            payload["status"] = getattr(response, "status", None)
++        _validate_response_complete(payload, usage=usage)
++
++        text = getattr(response, "output_text", None)
++        if not isinstance(text, str) or not text.strip():
++            text = extract_response_text(payload)
++        if not isinstance(text, str) or not text.strip():
+             raise RelationResponseError(
+-                f"OpenAI returned an incomplete response: {incomplete_details}",
++                f"OpenAI response {payload.get('id') or 'unknown'} returned "
++                "no structured response text.",
+                 usage=usage,
+                 retryable=True,
+-                reason=incomplete_reason,
+-            )
+-        refusal = _response_refusal(payload)
+-        if refusal:
+-            raise RelationResponseError(
+-                f"OpenAI refused the relation request: {refusal}",
+-                usage=usage,
+-                retryable=False,
+-            )
+-        text = getattr(response, "output_text", None)
+-        if not isinstance(text, str) or not text:
+-            text = extract_response_text(payload)
+-        if not text:
+-            raise RelationResponseError(
+-                "OpenAI returned no structured response text.",
+-                usage=usage,
+-                retryable=True,
++                reason="missing_output_text",
+             )
+         try:
+             parsed = json.loads(text)
+@@ -440,6 +507,7 @@
+                 f"The structured relation response failed local validation: {exc}",
+                 usage=usage,
+                 retryable=True,
++                reason="invalid_structured_output",
+             ) from exc
+         return triples, usage
+ 

@@ -41,7 +41,6 @@ from backend.pipeline.relation_extraction import (
     compact_json,
     effective_prompt_cache_shards,
     extract_response_text,
-    is_hormone_gene_relation,
     output_row,
     prepare_chunk,
     prompt_cache_key_for_request,
@@ -52,7 +51,7 @@ from backend.storage.artifacts import ArtifactStore, get_artifact_store
 
 logger = logging.getLogger(__name__)
 _ONE_MIB = 1024 * 1024
-_ONLINE_STATE_VERSION = "openai-responses-online-v1"
+_ONLINE_STATE_VERSION = "openai-responses-online-four-predicates"
 _USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
 _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -62,7 +61,7 @@ class RelationExecutorStopping(Exception):
 
 
 class RelationResponseError(RuntimeError):
-    """A completed response that could not be accepted locally."""
+    """An API response that could not be accepted as a valid extraction."""
 
     def __init__(
         self,
@@ -70,12 +69,15 @@ class RelationResponseError(RuntimeError):
         *,
         usage: Mapping[str, int] | None = None,
         retryable: bool = True,
+        reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.usage = _zero_usage()
         if usage:
             _add_usage(self.usage, usage)
         self.retryable = retryable
+        normalized_reason = str(reason or "").strip().casefold()
+        self.reason = normalized_reason or None
 
 
 def _zero_usage() -> dict[str, int]:
@@ -243,6 +245,9 @@ def _usage_from_response(body: Mapping[str, Any]) -> dict[str, int]:
 
 
 def _response_refusal(body: Mapping[str, Any]) -> str | None:
+    top_level = body.get("refusal")
+    if isinstance(top_level, str) and top_level.strip():
+        return top_level.strip()
     output = body.get("output")
     if not isinstance(output, list):
         return None
@@ -258,7 +263,86 @@ def _response_refusal(body: Mapping[str, Any]) -> str | None:
             refusal = part.get("refusal")
             if isinstance(refusal, str) and refusal.strip():
                 return refusal.strip()
+            # The refusal content type itself must not be accepted as success,
+            # even if a provider omitted the explanatory text.
+            return "The response contains a refusal without explanatory text."
     return None
+
+
+def _validate_response_complete(
+    body: Mapping[str, Any],
+    *,
+    usage: Mapping[str, int],
+) -> None:
+    """Reject incomplete/error/refused responses before reading any JSON text.
+
+    A parseable output_text is not evidence of a completed response. Preserve
+    usage and the incomplete reason so existing retry/accounting logic still
+    handles token-limit failures without treating them as empty extractions.
+    """
+
+    response_id = str(body.get("id") or "unknown")
+    status = str(body.get("status") or "").strip().casefold()
+    incomplete_details = body.get("incomplete_details")
+    error = body.get("error")
+    incomplete_reason = None
+    if isinstance(incomplete_details, Mapping):
+        value = incomplete_details.get("reason")
+        incomplete_reason = str(value or "").strip().casefold() or None
+    error_code = None
+    if isinstance(error, Mapping):
+        error_code = str(error.get("code") or "").strip().casefold() or None
+
+    if status != "completed":
+        reason = incomplete_reason or error_code or status or "missing_status"
+        raise RelationResponseError(
+            f"OpenAI response {response_id} is not completed: "
+            f"status={status or 'missing'!r}; "
+            f"incomplete_details={incomplete_details!r}; error={error!r}.",
+            usage=usage,
+            retryable=reason not in {"content_filter", "refusal"},
+            reason=reason,
+        )
+
+    # Reject contradictory completion metadata rather than trusting the text.
+    if error is not None or incomplete_details is not None:
+        reason = incomplete_reason or error_code or "invalid_completion_metadata"
+        raise RelationResponseError(
+            f"OpenAI response {response_id} reports completed but includes "
+            f"incomplete_details={incomplete_details!r}; error={error!r}.",
+            usage=usage,
+            retryable=reason not in {"content_filter", "refusal"},
+            reason=reason,
+        )
+
+    output = body.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, Mapping):
+                continue
+            item_status = item.get("status")
+            # Status is optional on some output item types. When supplied,
+            # a non-completed item must not contribute partial JSON.
+            if (
+                item_status is not None
+                and str(item_status).strip().casefold() != "completed"
+            ):
+                raise RelationResponseError(
+                    f"OpenAI response {response_id} contains an unfinished output "
+                    f"item {item.get('id') or 'unknown'}: status={item_status!r}.",
+                    usage=usage,
+                    retryable=True,
+                    reason="incomplete_output_item",
+                )
+
+    refusal = _response_refusal(body)
+    if refusal is not None:
+        raise RelationResponseError(
+            f"OpenAI refused the relation request (response {response_id}): {refusal}",
+            usage=usage,
+            retryable=False,
+            reason="refusal",
+        )
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -291,6 +375,14 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 def _retry_after(exc: BaseException) -> float | None:
+    # A token-limit retry is a local request-shaping correction, not a transient
+    # server condition. Retry immediately with the larger budget selected for
+    # the next attempt instead of waiting through exponential backoff.
+    if (
+        isinstance(exc, RelationResponseError)
+        and exc.reason == "max_output_tokens"
+    ):
+        return 0.0
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None)
     if headers is None:
@@ -321,6 +413,17 @@ async def _sleep_with_stop(stop: threading.Event, seconds: float) -> None:
         if remaining <= 0:
             return
         await asyncio.sleep(min(0.5, remaining))
+
+
+def _max_output_tokens_for_attempt(attempt: int) -> int:
+    """Return a bounded output budget that grows across request retries."""
+
+    base = max(1, int(settings.relation_max_output_tokens))
+    ceiling = max(base, int(settings.relation_max_output_tokens_ceiling))
+    retry_index = max(0, int(attempt) - 1)
+    # Avoid constructing an unnecessarily large integer for malformed values.
+    retry_index = min(retry_index, 16)
+    return min(ceiling, base * (2**retry_index))
 
 
 class OpenAIResponsesGateway:
@@ -360,11 +463,12 @@ class OpenAIResponsesGateway:
         item: PreparedChunk,
         *,
         cache_shards: int,
+        max_output_tokens: int,
     ) -> tuple[list[dict[str, Any]], dict[str, int]]:
         body = request_body(
             tagged_text=item.tagged_text,
             model=settings.relation_model,
-            max_output_tokens=settings.relation_max_output_tokens,
+            max_output_tokens=max_output_tokens,
             reasoning_effort=settings.relation_reasoning_effort,
             cache_key=prompt_cache_key_for_request(
                 settings.relation_prompt_cache_key,
@@ -375,45 +479,35 @@ class OpenAIResponsesGateway:
         response = await self.client.responses.create(**body)
         payload = _model_dict(response)
         usage = _usage_from_response(payload)
-        status = str(
-            getattr(response, "status", None) or payload.get("status") or ""
-        ).casefold()
-        if status == "incomplete":
-            raise RelationResponseError(
-                f"OpenAI returned an incomplete response: {payload.get('incomplete_details')}",
-                usage=usage,
-                retryable=True,
-            )
-        refusal = _response_refusal(payload)
-        if refusal:
-            raise RelationResponseError(
-                f"OpenAI refused the relation request: {refusal}",
-                usage=usage,
-                retryable=False,
-            )
+        # model_dump() normally includes status; keep compatibility with SDK
+        # response-like objects that expose it only as an attribute.
+        if payload.get("status") is None:
+            payload["status"] = getattr(response, "status", None)
+        _validate_response_complete(payload, usage=usage)
+
         text = getattr(response, "output_text", None)
-        if not isinstance(text, str) or not text:
+        if not isinstance(text, str) or not text.strip():
             text = extract_response_text(payload)
-        if not text:
+        if not isinstance(text, str) or not text.strip():
             raise RelationResponseError(
-                "OpenAI returned no structured response text.",
+                f"OpenAI response {payload.get('id') or 'unknown'} returned "
+                "no structured response text.",
                 usage=usage,
                 retryable=True,
+                reason="missing_output_text",
             )
         try:
             parsed = json.loads(text)
             triples = sanitize_triples(
                 parsed,
                 entities=item.entities,
-                require_hormone_gene_cell_context=(
-                    settings.relation_require_hormone_gene_cell_context
-                ),
             )
         except Exception as exc:
             raise RelationResponseError(
                 f"The structured relation response failed local validation: {exc}",
                 usage=usage,
                 retryable=True,
+                reason="invalid_structured_output",
             ) from exc
         return triples, usage
 
@@ -524,6 +618,29 @@ class RelationExecutor:
         self._guard = threading.Lock()
         self._running: set[str] = set()
         self._stop = threading.Event()
+        self._cancelled: set[str] = set()
+        self._active_async: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Task[Any]]] = {}
+
+    def _is_stopping(self, job_id: str) -> bool:
+        with self._guard:
+            return self._stop.is_set() or job_id in self._cancelled
+
+    def cancel(self, job_id: str) -> None:
+        """Stop future requests and cancel locally pending HTTP tasks for a job.
+
+        Requests already accepted by OpenAI may still incur usage charges.
+        Other local runs are unaffected.
+        """
+        with self._guard:
+            self._cancelled.add(job_id)
+            active = self._active_async.get(job_id)
+        self._fail(job_id, RelationExecutorStopping("Corpus update processing was cancelled."))
+        if active is not None:
+            loop, task = active
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # The event loop finished concurrently.
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -610,7 +727,7 @@ class RelationExecutor:
         )
 
     def submit(self, job_id: str) -> bool:
-        if self._stop.is_set():
+        if self._is_stopping(job_id):
             return False
         job = get_relation_job(job_id)
         if job is None or job.get("status") not in {"queued", "processing"}:
@@ -635,6 +752,8 @@ class RelationExecutor:
             self._running.discard(job_id)
         try:
             future.result()
+        except asyncio.CancelledError:
+            logger.info("Stage 3 relation job %s was cancelled", job_id)
         except Exception:
             logger.exception("Stage 3 relation job %s exited with an error", job_id)
 
@@ -807,7 +926,7 @@ class RelationExecutor:
                     return
                 custom_id = item.custom_id
                 while custom_id not in journal_state.relations_by_id:
-                    if self._stop.is_set():
+                    if self._is_stopping(job_id):
                         raise RelationExecutorStopping(
                             "Application shutdown paused relation extraction."
                         )
@@ -821,11 +940,15 @@ class RelationExecutor:
                         )
                         break
                     attempt = prior_attempts + 1
+                    request_max_output_tokens = _max_output_tokens_for_attempt(
+                        attempt
+                    )
                     await append_event(
                         {
                             "type": "attempt_started",
                             "custom_id": custom_id,
                             "attempt": attempt,
+                            "max_output_tokens": request_max_output_tokens,
                             "created_at": utc_now(),
                         }
                     )
@@ -837,6 +960,7 @@ class RelationExecutor:
                         triples, usage = await gateway.extract(
                             item,
                             cache_shards=cache_shards,
+                            max_output_tokens=request_max_output_tokens,
                         )
                     except asyncio.CancelledError:
                         in_flight = max(0, in_flight - 1)
@@ -855,6 +979,9 @@ class RelationExecutor:
                                 "type": "attempt_failed",
                                 "custom_id": custom_id,
                                 "attempt": attempt,
+                                "max_output_tokens": (
+                                    request_max_output_tokens
+                                ),
                                 "retryable": retryable,
                                 "error": error,
                                 "usage": usage,
@@ -886,6 +1013,9 @@ class RelationExecutor:
                                 "type": "attempt_succeeded",
                                 "custom_id": custom_id,
                                 "attempt": attempt,
+                                "max_output_tokens": (
+                                    request_max_output_tokens
+                                ),
                                 "triples": triples,
                                 "usage": usage,
                                 "created_at": utc_now(),
@@ -962,14 +1092,13 @@ class RelationExecutor:
             "request_timeout_seconds": settings.relation_request_timeout_seconds,
             "max_request_retries": settings.relation_max_request_retries,
             "prompt_cache_shards": settings.relation_prompt_cache_shards,
-            "cell_context_required": (
-                settings.relation_require_hormone_gene_cell_context
-            ),
         }
 
     def _run(self, job_id: str) -> None:
         try:
-            asyncio.run(self._run_async(job_id))
+            asyncio.run(self._run_tracked(job_id))
+        except asyncio.CancelledError:
+            logger.info("Relation extraction job %s was cancelled", job_id)
         except RelationExecutorStopping:
             logger.info(
                 "Relation extraction job %s paused for application shutdown",
@@ -979,6 +1108,17 @@ class RelationExecutor:
             logger.exception("Relation extraction job %s failed", job_id)
             self._fail(job_id, exc)
             shutil.rmtree(settings.relation_jobs_dir / job_id, ignore_errors=True)
+
+    async def _run_tracked(self, job_id: str) -> None:
+        with self._guard:
+            self._active_async[job_id] = (asyncio.get_running_loop(), asyncio.current_task())
+        try:
+            if self._is_stopping(job_id):
+                raise RelationExecutorStopping("Corpus update processing was cancelled.")
+            await self._run_async(job_id)
+        finally:
+            with self._guard:
+                self._active_async.pop(job_id, None)
 
     async def _run_async(self, job_id: str) -> None:
         job = get_relation_job(job_id)
@@ -1075,15 +1215,6 @@ class RelationExecutor:
                         stats.get("dropped_overlap_count") or 0
                     ),
                     "relation_count": int(job.get("relation_count") or 0),
-                    "cell_context_count": int(
-                        job.get("cell_context_count") or 0
-                    ),
-                    "hormone_gene_relation_count": int(
-                        stats.get("hormone_gene_relation_count") or 0
-                    ),
-                    "hormone_gene_without_context_count": int(
-                        stats.get("hormone_gene_without_context_count") or 0
-                    ),
                     "api_request_count": int(job.get("api_request_count") or 0),
                     "retry_count": int(stats.get("retry_count") or 0),
                     "window_count": int(stats.get("window_count") or 0),
@@ -1133,7 +1264,7 @@ class RelationExecutor:
 
                 row_index = processed
                 while processed < total_chunks:
-                    if self._stop.is_set():
+                    if self._is_stopping(job_id):
                         raise RelationExecutorStopping(
                             "Application shutdown paused relation extraction."
                         )
@@ -1231,9 +1362,6 @@ class RelationExecutor:
 
                     rows: list[dict[str, Any]] = []
                     window_relation_count = 0
-                    window_cell_context_count = 0
-                    window_hg_count = 0
-                    window_hg_without_context = 0
                     window_by_predicate: dict[str, int] = {}
                     window_by_direction: dict[str, int] = {}
                     for item in items:
@@ -1251,15 +1379,6 @@ class RelationExecutor:
                             window_by_direction[direction] = (
                                 window_by_direction.get(direction, 0) + 1
                             )
-                            if is_hormone_gene_relation(
-                                str(triple["subject"]),
-                                str(triple["object"]),
-                            ):
-                                window_hg_count += 1
-                                if triple.get("cell_context"):
-                                    window_cell_context_count += 1
-                                else:
-                                    window_hg_without_context += 1
 
                     checkpoint_state = _read_json_object(pending_state_path)
                     if int(checkpoint_state.get("window_start") or 0) != processed:
@@ -1329,11 +1448,6 @@ class RelationExecutor:
                     counters["skipped_chunk_count"] += skipped_in_window
                     counters["dropped_overlap_count"] += dropped_in_window
                     counters["relation_count"] += window_relation_count
-                    counters["cell_context_count"] += window_cell_context_count
-                    counters["hormone_gene_relation_count"] += window_hg_count
-                    counters["hormone_gene_without_context_count"] += (
-                        window_hg_without_context
-                    )
                     counters["api_request_count"] += attempt_count
                     counters["retry_count"] += retry_count
                     counters["window_count"] += 1
@@ -1362,7 +1476,6 @@ class RelationExecutor:
                         processed_chunk_count=processed,
                         eligible_chunk_count=counters["eligible_chunk_count"],
                         relation_count=counters["relation_count"],
-                        cell_context_count=counters["cell_context_count"],
                         api_request_count=counters["api_request_count"],
                         stats=stats_snapshot,
                         elapsed_seconds=_elapsed_since(
@@ -1465,8 +1578,8 @@ class RelationExecutor:
                         ),
                         "reasoning_effort": settings.relation_reasoning_effort,
                         "max_output_tokens": settings.relation_max_output_tokens,
-                        "hormone_gene_cell_context_required": (
-                            settings.relation_require_hormone_gene_cell_context
+                        "max_output_tokens_ceiling": (
+                            settings.relation_max_output_tokens_ceiling
                         ),
                     },
                     "stats": final_stats,
@@ -1496,7 +1609,6 @@ class RelationExecutor:
                     processed_chunk_count=processed,
                     eligible_chunk_count=counters["eligible_chunk_count"],
                     relation_count=counters["relation_count"],
-                    cell_context_count=counters["cell_context_count"],
                     api_request_count=counters["api_request_count"],
                     stats={**final_stats, "elapsed_seconds": elapsed},
                     elapsed_seconds=elapsed,

@@ -1,9 +1,17 @@
-"""Cost-conscious relation extraction helpers for tagged ovarian-literature chunks.
+"""Condition-aware relation extraction for tagged ovarian-literature chunks.
 
-This module is deliberately independent of FastAPI and the OpenAI client.  It
-prepares one compact request per eligible chunk, validates every returned
-relation locally, and emits small text-free rows that can later feed network
-generation.
+Complete replacement for the supplied relation-extraction helper module.
+The public function names and signatures are preserved, as are the existing
+entity preparation, normalization, overlap rules, and request-routing helpers.
+
+Every sanitized relation contains subject, predicate, object, and conditions.
+Conditions are plain text; an empty string means no condition was supplied.
+Only leading/trailing whitespace is removed from condition text. Distinct
+condition strings remain distinct assertions, even for identical endpoints.
+
+This module uses the same two project dependencies as the original:
+backend.pipeline.identifier_identity and backend.pipeline.entity_artifacts.
+It does not itself send API requests, update the database, or format labels.
 """
 
 from __future__ import annotations
@@ -15,87 +23,80 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
-RELATION_PIPELINE_VERSION = "ovarian-openai-online-relations-v1"
-RELATION_OUTPUT_SCHEMA = "chunk-biological-relations-v1"
-PROMPT_VERSION = "ovarian-relations-prompt-v1"
+from backend.pipeline.identifier_identity import canonical_identifier
 
-BASE_PREDICATES: tuple[str, ...] = (
+
+# Distinguish the new extraction contract from previously saved three-field rows.
+# Callers must still rerun extraction rather than reuse old result artifacts.
+RELATION_PIPELINE_VERSION = "ovarian-openai-online-four-relations-conditions-v4"
+RELATION_OUTPUT_SCHEMA = "chunk-biological-relations-four-relations-conditions-v1"
+PROMPT_VERSION = "ovarian-relations-four-relations-direct-proximal-conditions-v1"
+
+ALLOWED_PREDICATES: tuple[str, ...] = (
     "activation",
     "inhibition",
     "proliferation",
     "secreted",
-    "binding",
-    "upregulation",
-    "downregulation",
 )
 CACHE_TARGET_REQUESTS_PER_SHARD = 15
 
 ENTITY_PREFIX = {"cell": "C", "gene": "G", "protein": "G", "hormone": "H"}
-PREFIX_TYPE = {"C": "cell", "G": "gene", "H": "hormone"}
 ENTITY_PRIORITY = {"cell": 0, "hormone": 1, "gene": 2, "protein": 2}
 _ID_RE = re.compile(r"^[CGH]\d+$")
-_CELL_ID_RE = re.compile(r"^C\d+$")
 
-# Static instructions are intentionally placed before the changing chunk.  The
-# request schema is also static, so repeated requests share a long exact prefix
-# that is eligible for automatic prompt caching.
-SYSTEM_INSTRUCTIONS = """
-You extract only explicit biological relations between tagged entities in ovarian biomedical text.
+
+# Keep static instructions and schema separate from the changing chunk text.
+SYSTEM = """
+Extract only biological relations that are explicitly supported by the text
+between tagged entities.
 
 Tags:
-- [C1]...[/C1]: cell or cell type
-- [G1]...[/G1]: gene or protein
-- [H1]...[/H1]: hormone
-IDs are local to the supplied chunk. Use only visible IDs.
+- [C1]...[/C1] = cell type
+- [G1]...[/G1] = gene/protein
+- [H1]...[/H1] = hormone
 
-Return one JSON object with the key "triples". Each triple contains exactly:
-- subject: visible entity ID
-- predicate: allowed predicate
-- object: visible entity ID
-- cell_context: array of visible C IDs
+Trust the entity type assigned by each tag.
 
-Extract only relations explicitly asserted in the chunk. Do not infer from background knowledge, typical biology, co-occurrence, correlation, an experimental aim, or a cited result not stated in the supplied text. Respect negation, uncertainty, comparison, attribution, passive voice, and cross-sentence references. 
+Return exactly one JSON object and no other text:
+{"triples":[{"subject":"G1","predicate":"activation","object":"C1"}]}
 
 Allowed predicates and directions:
-1. activation: G -> C, H -> C, or H -> G. Use for explicit activation, stimulation, induction, triggering, or promotion of cell behavior or gene/protein function. For H -> G expression or abundance changes, use upregulation instead.
-2. inhibition: G -> C, H -> C, or H -> G. Use for explicit inhibition, blockade, suppression, prevention, attenuation, or impairment. For H -> G expression or abundance changes, use downregulation instead.
-3. proliferation: G -> C or H -> C. Use only when the tagged cell population explicitly proliferates, divides, expands in cell number, or undergoes mitosis.
-4. secreted: C -> G or C -> H. For C -> G, require explicit secretion, release, or export. For C -> H, use secreted when the cell explicitly secretes, releases, produces, generates, synthesizes, or is identified as the cellular source of the hormone.
-5. binding: H -> G. Use only for explicit binding, receptor engagement, ligand-receptor association, or direct physical interaction.
-6. upregulation: H -> G. Use only when the hormone explicitly increases expression, transcription, translation, or abundance of the gene/protein.
-7. downregulation: H -> G. Use only when the hormone explicitly decreases expression, transcription, translation, or abundance of the gene/protein.
 
-Validation rules:
-- Never output G -> G, C -> C, self-relations, or a predicate-direction combination outside the matrix.
-- Never output C secreted C, H secreted C, or G secreted C.
-- A measured change in concentration, staining, density, expression, or abundance is not secretion unless the tagged cell is explicitly identified as the source.
-- Shared pathway membership, treatment response, or statistical association is not binding.
-- Emit each semantic relation once and return at most 50 unique triples.
+activation:
+Use for both functional activation and upregulation.
+The subject explicitly increases the activity or signaling of a gene/protein; increases its expression, transcription, translation, mRNA level, protein level, or abundance; or induces a cell to enter an activated, effector, differentiated, or polarized state. Do not infer activation from correlation, binding, secretion, migration,
+invasion, EMT, survival, or proliferation alone.
+  
+- inhibition:
+Use for both functional inhibition and downregulation.
+The subject explicitly decreases the activity, signaling, expression, abundance, stability, survival, viability, proliferation, or another clearly defined biological function of the object. For a gene/protein object, this includes reduced molecular activity or signaling; decreased transcription, mRNA level, protein level, or abundance; and increased degradation or inactivation. For a hormone object, this includes degradation or inactivation that reduces
+its abundance, stability, bioavailability, or biological activity. For a cell object, this includes suppressed activation or function, reduced proliferation or viability, apoptosis, cytotoxicity, cell killing, or another form of cell death.
+  
+- proliferation: C->C, G->C, H->C
+  The subject increases proliferation, cell division, mitosis, or proliferative or clonal expansion of the object cell. Include increased cell numbers in an expansion context.
 
+- secreted: C->G, C->H
+  The subject cell secretes, releases, sheds, produce or exports the object protein or hormone.
 
-Examples:
-- "[G1]KITLG[/G1] activated [C1]oocytes[/C1]" -> G1 activation C1.
-- "[C1]Oocytes[/C1] were activated by [G1]KITLG[/G1]" -> G1 activation C1.
-- "[H1]FSH[/H1] increased the number of [C1]granulosa cells[/C1]" -> H1 proliferation C1.
-- "[H1]Estradiol[/H1] increased [G1]FSHR[/G1] expression in [C1]granulosa cells[/C1]" -> H1 upregulation G1 with cell_context [C1].
-- "[H1]Estradiol[/H1] activated [G1]ESR1[/G1] signaling" -> H1 activation G1.
-- "[C1]Granulosa cells[/C1] released [G1]VEGFA[/G1]" -> C1 secreted G1.
-- "[C1]Granulosa cells[/C1] synthesized [H1]estradiol[/H1]" -> C1 secreted H1.
-- "[H1]Estradiol[/H1] bound [G1]ESR1[/G1] in [C1]granulosa cells[/C1]" -> H1 binding G1 with cell_context [C1].
-- "Neither [H1]estradiol[/H1] nor vehicle altered [G1]FSHR[/G1]" -> no relation.
-- "We tested whether [H1]estradiol[/H1] increases [G1]FSHR[/G1]" -> no relation unless the result is also asserted.
-
-If no valid relation is explicit, return {"triples":[]}.
+Rules:
+- Use only tagged IDs present in the text and output them without brackets.
+- Both the subject and object must be tagged entities.
+- Preserve biological direction, including relations written in passive voice.
+- Exact predicate words are not required; use the explicit biological meaning.
+-A cell merely expressing or being positive for a marker is not a causal C->G relation.
+- Do not infer indirect, transitive, or pathway-mediated relations. Keep direct, explicit, proximal, and causally supported relations.
+- Use cross-sentence evidence only when the reference and direction are unambiguous.
+- Exclude study aims, unsupported hypotheses, explicit null findings, correlations, co-occurrence, binding alone, directionless associations, unsupported directions, and self-relations.
+- If no valid relation exists, return {"triples":[]}.
 """.strip()
 
 
 def allowed_predicates() -> tuple[str, ...]:
-    return BASE_PREDICATES
+    return ALLOWED_PREDICATES
 
 
 def response_schema() -> dict[str, Any]:
-    """Return one invariant schema for every request in a deployment."""
-
+    """Require exactly four fields per relation, including a plain-text condition."""
     return {
         "type": "object",
         "properties": {
@@ -110,20 +111,12 @@ def response_schema() -> dict[str, Any]:
                             "enum": list(allowed_predicates()),
                         },
                         "object": {"type": "string"},
-                        "cell_context": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
+                        "conditions": {"type": "string"},
                     },
-                    "required": [
-                        "subject",
-                        "predicate",
-                        "object",
-                        "cell_context",
-                    ],
+                    "required": ["subject", "predicate", "object", "conditions"],
                     "additionalProperties": False,
                 },
-            }
+            },
         },
         "required": ["triples"],
         "additionalProperties": False,
@@ -135,30 +128,29 @@ def relation_allowed(
     predicate: str,
     object_: str,
 ) -> bool:
-    """Enforce the exact entity-direction matrix requested by the project."""
+    """Validate one relation against the four-predicate direction rules.
 
-    if subject == object_ or _ID_RE.fullmatch(subject) is None:
+    Activation and inhibition have no entity-type pairing restriction: any C,
+    G, or H tag may be the subject or object. Proliferation and secretion keep
+    their biologically constrained directions.
+    """
+
+    if subject == object_:
         return False
-    if _ID_RE.fullmatch(object_) is None:
+    if _ID_RE.fullmatch(subject) is None or _ID_RE.fullmatch(object_) is None:
         return False
-    source_type = PREFIX_TYPE.get(subject[0])
-    target_type = PREFIX_TYPE.get(object_[0])
-    pair = (source_type, target_type)
 
-    matrix: dict[str, set[tuple[str, str]]] = {
-        "activation": {("gene", "cell"), ("hormone", "cell"), ("hormone", "gene")},
-        "inhibition": {("gene", "cell"), ("hormone", "cell"), ("hormone", "gene")},
-        "proliferation": {("gene", "cell"), ("hormone", "cell")},
-        "secreted": {("cell", "gene"), ("cell", "hormone")},
-        "binding": {("hormone", "gene")},
-        "upregulation": {("hormone", "gene")},
-        "downregulation": {("hormone", "gene")},
-    }
-    return pair in matrix.get(predicate, set())
+    normalized_predicate = str(predicate or "").strip().casefold()
+    if normalized_predicate not in ALLOWED_PREDICATES:
+        return False
 
-
-def is_hormone_gene_relation(subject: str, object_: str) -> bool:
-    return {subject[:1], object_[:1]} == {"G", "H"}
+    if normalized_predicate in {"activation", "inhibition"}:
+        return True
+    if normalized_predicate == "proliferation":
+        return object_.startswith("C")
+    if normalized_predicate == "secreted":
+        return subject.startswith("C") and object_[0] in {"G", "H"}
+    return False
 
 
 def has_possible_allowed_pair(entity_ids: Iterable[str]) -> bool:
@@ -194,15 +186,6 @@ def _annotation_span(annotation: Mapping[str, Any], text: str) -> tuple[int, int
         end = _as_int(annotation.get("end"))
         if start is None or end is None:
             return None
-        mention = annotation.get("mention")
-        # Stage 2 stores exclusive ends. This compatibility branch only adjusts
-        # an inclusive end when the mention length proves that convention.
-        if (
-            isinstance(mention, str)
-            and end - start + 1 == len(mention)
-            and text[start : end + 1] == mention
-        ):
-            end += 1
     if start < 0 or end <= start or end > len(text):
         return None
     return start, end
@@ -212,25 +195,42 @@ def _normalized_entity_key(
     annotation: Mapping[str, Any], start: int, end: int
 ) -> str:
     entity_type = str(annotation.get("obj") or "").casefold()
-    # Stage 2 can label the same normalized HGNC/NCBI entity as either gene or
-    # protein. Both map to G tags, so normalize the key as well and reuse one ID.
+    # Stage 2 uses the approved HGNC ID as the canonical gene/protein identity.
+    # Gene and protein source labels both map to G tags and reuse one ID.
     key_type = "gene" if entity_type == "protein" else entity_type
     candidates: tuple[str, ...]
     if entity_type == "cell":
         candidates = ("concept_id", "cell_ontology_id", "normalized_id")
     elif entity_type in {"gene", "protein"}:
-        candidates = ("gene_id", "concept_id", "normalized_id")
+        candidates = (
+            "concept_id",
+            "hgnc_id",
+            "normalized_id",
+            "ncbi_gene_id",
+            "gene_id",
+            "pubtator_gene_id",
+        )
     else:
         candidates = (
-            "hormone_id",
-            "chemical_id",
             "concept_id",
+            "mesh_id",
+            "hormone_id",
             "normalized_id",
+            "pubtator_mesh_id",
+            "chemical_id",
+            # Rolling-deployment compatibility for older hormone rows.
+            "chebi_id",
+            "hgnc_id",
         )
     for field in candidates:
         value = annotation.get(field)
         if value is not None and str(value).strip():
-            return f"{key_type}:{field}:{str(value).strip()}"
+            namespace, canonical_value = canonical_identifier(
+                key_type,
+                field,
+                value,
+            )
+            return f"{key_type}:{namespace or field}:{canonical_value or str(value).strip()}"
     mention = str(annotation.get("mention") or "").strip().casefold()
     if mention:
         return f"{key_type}:mention:{mention}"
@@ -273,38 +273,75 @@ def _compact_entity(tag: str, span: _Span) -> dict[str, Any]:
         "obj": "gene" if span.entity_type == "protein" else span.entity_type,
         "mention": str(annotation.get("mention") or ""),
         "concept_id": annotation.get("concept_id"),
+        "normalized_id": annotation.get("normalized_id")
+        or annotation.get("concept_id"),
         "preferred_label": annotation.get("preferred_label"),
     }
-    if span.prefix == "G":
-        row["gene_id"] = annotation.get("gene_id")
-        for field in ("tax_id", "tax_name", "taxonomy_source"):
-            value = annotation.get(field)
-            if value not in (None, ""):
-                row[field] = value
-    elif span.prefix == "H":
-        row["hormone_id"] = annotation.get("hormone_id") or annotation.get(
-            "chemical_id"
-        )
-    return {key: value for key, value in row.items() if value not in (None, "")}
+
+    shared_fields = (
+        "canonical_id_type",
+        "canonical_name",
+        "normalization_source",
+        "normalization_status",
+        "source_concept_id",
+        "label_source",
+        "identified_source",
+        "recognition_source",
+        "seed_evidence",
+    )
+    gene_fields = (
+        "hgnc_id",
+        "hgnc_group_id",
+        "entity_granularity",
+        "entity_role",
+        "tax_id",
+        "tax_name",
+        "taxonomy_source",
+        "expanded_long_form",
+        "ncbi_gene_id",
+        "uniprot_ids",
+    )
+    hormone_fields = (
+        "hormone_id",
+        "mesh_id",
+        "pubtator_mesh_id",
+        "chemical_id",
+        "hormone_classification_source",
+    )
+    entity_fields = (
+        gene_fields
+        if span.prefix == "G"
+        else hormone_fields
+        if span.prefix == "H"
+        else ()
+    )
+    fields = shared_fields + entity_fields
+    for field in fields:
+        value = annotation.get(field)
+        if value not in (None, "", [], ()):
+            row[field] = value
+
+    return {key: value for key, value in row.items() if value not in (None, "", [], ())}
 
 
 def _select_non_crossing_spans(spans: list[_Span]) -> tuple[list[_Span], int]:
-    # Long, normalized spans win only when two recognizers produce a crossing
-    # overlap. Contained and exact spans remain representable as nested tags.
-    ranked = sorted(
-        spans,
-        key=lambda item: (
-            -(item.end - item.start),
-            ENTITY_PRIORITY.get(item.entity_type, 99),
-            item.start,
-            item.end,
-            item.key,
-        ),
-    )
+    # Exact-span cell > hormone > gene; longer spans still win across types.
+    type_order = {"cell": 0, "hormone": 1, "gene": 2, "protein": 2}
+    span_type = {}
+    for item in spans:
+        pair = (item.start, item.end)
+        span_type[pair] = min(type_order.get(item.entity_type, 99), span_type.get(pair, 99))
+    eligible = [item for item in spans if type_order.get(item.entity_type, 99)
+                == span_type[(item.start, item.end)]]
+    ranked = sorted(eligible, key=lambda item: (
+        -(item.end - item.start), item.start, item.end,
+        type_order.get(item.entity_type, 99), item.key,
+    ))
     selected: list[_Span] = []
-    dropped = 0
+    dropped = len(spans) - len(eligible)
     for candidate in ranked:
-        if any(_crosses(candidate, kept) for kept in selected):
+        if any(candidate.start < kept.end and candidate.end > kept.start
+               for kept in selected):
             dropped += 1
             continue
         selected.append(candidate)
@@ -385,9 +422,26 @@ def prepare_chunk(
     raw_annotations = annotation_row.get("annotations")
     if not isinstance(raw_annotations, list):
         raw_annotations = []
+    valid_annotation_count = sum(
+        1 for annotation in raw_annotations if isinstance(annotation, Mapping)
+    )
+    from backend.pipeline.entity_artifacts import _resolve_annotation_conflicts
+    raw_annotations = _resolve_annotation_conflicts(raw_annotations, text=text)
+    cell_gene_overlap_drops = valid_annotation_count - len(raw_annotations)
+
+    hormone_spans: set[tuple[int, int]] = set()
+    for raw in raw_annotations:
+        if not isinstance(raw, Mapping):
+            continue
+        if str(raw.get("obj") or "").casefold() != "hormone":
+            continue
+        span = _annotation_span(raw, text)
+        if span is not None:
+            hormone_spans.add(span)
 
     spans: list[_Span] = []
     seen: set[tuple[Any, ...]] = set()
+    same_span_gene_drops = 0
     for raw in raw_annotations:
         if not isinstance(raw, Mapping):
             continue
@@ -399,6 +453,9 @@ def prepare_chunk(
         if span is None:
             continue
         start, end = span
+        if entity_type in {"gene", "protein"} and (start, end) in hormone_spans:
+            same_span_gene_drops += 1
+            continue
         key = _normalized_entity_key(raw, start, end)
         signature = (start, end, key, prefix)
         if signature in seen:
@@ -416,6 +473,7 @@ def prepare_chunk(
         )
 
     selected, dropped = _select_non_crossing_spans(spans)
+    dropped += same_span_gene_drops + cell_gene_overlap_drops
     key_to_tag: dict[tuple[str, str], str] = {}
     next_index = {"C": 1, "G": 1, "H": 1}
     entities: dict[str, dict[str, Any]] = {}
@@ -466,7 +524,7 @@ def prompt_cache_key_for_request(
     shard = int.from_bytes(digest, "big") % safe_shards
     width = max(1, len(str(safe_shards - 1)))
     suffix = f":{shard:0{width}d}"
-    prefix = (base_key.strip() or "ovarian-relations-v4")[: 64 - len(suffix)]
+    prefix = (base_key.strip() or "ovarian-relations-four-predicates")[: 64 - len(suffix)]
     return prefix + suffix
 
 
@@ -500,7 +558,7 @@ def request_body(
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": model,
-        "instructions": SYSTEM_INSTRUCTIONS,
+        "instructions": SYSTEM,
         "input": minimal_user_input(tagged_text),
         "max_output_tokens": max_output_tokens,
         "store": False,
@@ -517,7 +575,6 @@ def request_body(
     if reasoning_effort:
         body["reasoning"] = {"effort": reasoning_effort}
     return body
-
 
 
 def extract_response_text(body: Mapping[str, Any]) -> str:
@@ -543,13 +600,48 @@ def extract_response_text(body: Mapping[str, Any]) -> str:
     return "".join(parts)
 
 
+def _conditions_text(value: Any) -> str:
+    """Validate a plain string without guessing, truncating, or rewriting context.
+
+    Callers may supply "" for a missing legacy field. Explicit nulls, lists,
+    objects, and other non-string values are errors: silently replacing such
+    values could turn a qualified assertion into an unqualified one.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            "Relation 'conditions' must be a string; use an empty string "
+            "when no condition is stated."
+        )
+    return value.strip()
+
+
 def sanitize_triples(
     parsed: Any,
     *,
     entities: Mapping[str, Mapping[str, Any]],
-    require_hormone_gene_cell_context: bool,
-    max_triples: int = 50,
-) -> list[dict[str, Any]]:
+    max_triples: int | None = None,
+) -> list[dict[str, str]]:
+    """Validate, deduplicate, and sort relations without losing their conditions.
+
+    The assertion key is (subject, predicate, object, conditions), not merely
+    the first three fields. Different doses, treatment partners, or contexts
+    therefore remain separate records. No semantic merging is attempted.
+
+    Newly generated responses must contain conditions according to the request
+    schema. For compatibility with old stored records, a missing field defaults
+    to ""; this does NOT recover context that an older extraction omitted.
+    Explicit non-string condition values raise instead of losing context.
+
+    max_triples remains an overflow guard, not a truncation limit. It counts
+    unique qualified assertions, including those with identical endpoints.
+    """
+    if max_triples is not None and (
+        isinstance(max_triples, bool)
+        or not isinstance(max_triples, int)
+        or max_triples < 0
+    ):
+        raise ValueError("max_triples must be None or a non-negative integer.")
+
     if not isinstance(parsed, Mapping):
         raise ValueError("The model response is not a JSON object.")
     raw_triples = parsed.get("triples")
@@ -557,9 +649,9 @@ def sanitize_triples(
         raise ValueError("The model response has no triples array.")
 
     allowed_ids = set(entities)
-    cleaned: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
-    for raw in raw_triples[:max_triples]:
+    cleaned: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for raw in raw_triples:
         if not isinstance(raw, Mapping):
             continue
         subject = str(raw.get("subject") or "").strip()
@@ -570,24 +662,8 @@ def sanitize_triples(
         if not relation_allowed(subject, predicate, object_):
             continue
 
-        context: list[str] = []
-        if is_hormone_gene_relation(subject, object_):
-            raw_context = raw.get("cell_context")
-            if isinstance(raw_context, list):
-                context = sorted(
-                    {
-                        str(value).strip()
-                        for value in raw_context
-                        if isinstance(value, str)
-                        and _CELL_ID_RE.fullmatch(value.strip()) is not None
-                        and value.strip() in allowed_ids
-                    },
-                    key=lambda value: int(value[1:]),
-                )
-            if require_hormone_gene_cell_context and not context:
-                continue
-        # Context on non-H/G relations is prohibited rather than trusted.
-        key = (subject, predicate, object_, tuple(context))
+        conditions = _conditions_text(raw.get("conditions", ""))
+        key = (subject, predicate, object_, conditions)
         if key in seen:
             continue
         seen.add(key)
@@ -596,7 +672,7 @@ def sanitize_triples(
                 "subject": subject,
                 "predicate": predicate,
                 "object": object_,
-                "cell_context": context,
+                "conditions": conditions,
             }
         )
 
@@ -607,9 +683,15 @@ def sanitize_triples(
             row["predicate"],
             row["object"][0],
             int(row["object"][1:]),
-            tuple(row["cell_context"]),
+            row["conditions"],
         )
     )
+    if max_triples is not None and len(cleaned) > max_triples:
+        raise ValueError(
+            f"The model response contains {len(cleaned)} valid unique triples, "
+            f"exceeding max_triples={max_triples}. "
+            "Refusing to discard relations silently."
+        )
     return cleaned
 
 
@@ -617,13 +699,21 @@ def output_row(
     prepared: PreparedChunk,
     triples: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    """Build the stored row from sanitized triples, always retaining conditions.
+
+    Endpoint IDs remain chunk-local tags, as in the original module. Human-
+    readable labels are produced by downstream code, which must also copy the
+    conditions field. Text-only co-treatment names do not create extra edges.
+    """
+    relations: list[dict[str, Any]] = []
     referenced: set[str] = set()
     for triple in triples:
-        referenced.add(str(triple.get("subject") or ""))
-        referenced.add(str(triple.get("object") or ""))
-        context = triple.get("cell_context")
-        if isinstance(context, list):
-            referenced.update(str(value) for value in context)
+        record = dict(triple)
+        record["conditions"] = _conditions_text(triple.get("conditions", ""))
+        relations.append(record)
+        referenced.add(str(record.get("subject") or ""))
+        referenced.add(str(record.get("object") or ""))
+
     entities = [
         prepared.entities[entity_id]
         for entity_id in sorted(
@@ -633,7 +723,7 @@ def output_row(
     ]
     row = dict(prepared.identity)
     row["entities"] = entities
-    row["relations"] = [dict(triple) for triple in triples]
+    row["relations"] = relations
     return row
 
 
@@ -642,18 +732,17 @@ def compact_json(payload: Any) -> str:
 
 
 __all__ = [
-    "BASE_PREDICATES",
+    "ALLOWED_PREDICATES",
     "PROMPT_VERSION",
     "PreparedChunk",
     "RELATION_OUTPUT_SCHEMA",
     "RELATION_PIPELINE_VERSION",
-    "SYSTEM_INSTRUCTIONS",
+    "SYSTEM",
     "allowed_predicates",
     "compact_json",
     "effective_prompt_cache_shards",
     "extract_response_text",
     "has_possible_allowed_pair",
-    "is_hormone_gene_relation",
     "output_row",
     "prepare_chunk",
     "prompt_cache_key_for_request",

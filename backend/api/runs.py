@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Literal, Mapping
 
 import requests
 from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from backend.config import settings
 from backend.orchestrator import RetrievalError, pipeline_orchestrator
+from backend.pipeline.annotation_download import sanitize_jsonl_files
+from backend.pipeline.entity_overlap import ENTITY_OVERLAP_POLICY
+from backend.pipeline.precomputed_corpora import (
+    DEFAULT_CORPUS_ID,
+    CorpusNotFoundError,
+    corpus_definition,
+    corpus_root,
+)
 from backend.runtime import run_registry
 from backend.storage.artifacts import ArtifactRef, get_artifact_store
 
@@ -20,7 +29,30 @@ _ONE_MIB = 1024 * 1024
 
 
 class RunCreate(BaseModel):
-    query: str = Field(default="", max_length=4000)
+    query: str = Field(
+        default="",
+        max_length=4000,
+        description=(
+            "Comma-separated PMIDs. The public deployment loads saved results "
+            "only; local installations can analyze arbitrary PMIDs. Leave blank "
+            "to load the selected saved corpus."
+        ),
+    )
+
+    corpus_id: Literal[
+        "non_neoplastic_inflammatory",
+        "cancer_associated_inflammatory",
+    ] = Field(
+        default=DEFAULT_CORPUS_ID,
+        description="Permanent saved corpus used when the PMID field is blank.",
+    )
+
+    text_mode: Literal["abstract", "fulltext"] = Field(
+        default="fulltext",
+        description=(
+            "For PMID runs, use PubMed abstracts only or PMC full text when available."
+        ),
+    )
 
     @field_validator("query")
     @classmethod
@@ -49,6 +81,8 @@ def _clean_run_id(run_id: str) -> str:
 def _run(run_id: str) -> dict[str, Any]:
     cleaned = _clean_run_id(run_id)
     try:
+        if run_registry.get_private(cleaned, "trusted_update", False):
+            raise HTTPException(status_code=404, detail="Run not found.")
         return run_registry.public(cleaned)
     except KeyError as exc:
         raise HTTPException(
@@ -61,10 +95,15 @@ def _run(run_id: str) -> dict[str, Any]:
 
 
 @router.post("/runs", status_code=202)
-def create_run(payload: RunCreate) -> dict[str, Any]:
+def create_run(payload: RunCreate, request: Request) -> dict[str, Any]:
     try:
-        return pipeline_orchestrator.create_run(payload.query)
-    except RetrievalError as exc:
+        return pipeline_orchestrator.create_run(
+            payload.query,
+            text_mode=payload.text_mode,
+            corpus_id=payload.corpus_id,
+            callback_base_url=str(request.base_url).rstrip("/"),
+        )
+    except (RetrievalError, CorpusNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
@@ -94,6 +133,8 @@ def start_stage(
         raise HTTPException(status_code=404, detail="Run not found.") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -119,56 +160,100 @@ def annotation_callback(
     return {"status": "accepted"}
 
 
-def _artifact_stream(refs: list[dict[str, Any]]) -> Iterator[bytes]:
+def _download_source_path(
+    ref: ArtifactRef,
+    *,
+    destination: Path,
+) -> Path:
+    """Return a local readable copy of an artifact."""
+
     store = get_artifact_store()
-    for raw in refs:
-        ref = ArtifactRef.from_dict(raw)
-        local = store.local_path(ref.key)
-        if local is not None:
-            with local.open("rb") as handle:
-                while block := handle.read(_ONE_MIB):
-                    yield block
-            continue
-        url = store.presign_get(
-            ref.key,
-            expires_seconds=settings.artifact_presigned_ttl_seconds,
-        )
-        with requests.get(url, stream=True, timeout=(20, 900)) as response:
-            response.raise_for_status()
+    local = store.local_path(ref.key)
+    if local is not None:
+        return local
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    url = store.presign_get(
+        ref.key,
+        expires_seconds=settings.artifact_presigned_ttl_seconds,
+    )
+    with requests.get(url, stream=True, timeout=(20, 900)) as response:
+        response.raise_for_status()
+        with destination.open("wb") as output:
             for block in response.iter_content(chunk_size=_ONE_MIB):
                 if block:
-                    yield block
+                    output.write(block)
+    return destination
+
+
+def _sanitized_download_root(run_id: str) -> Path:
+    root = (settings.data_dir / "runs" / run_id / "downloads").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 @router.get("/runs/{run_id}/download/{stage_name}")
 def download_stage(run_id: str, stage_name: str):
     cleaned = _clean_run_id(run_id)
     run = _run(cleaned)
-    public_to_internal = {
-        "stage1": "retrieval",
-        "stage2": "annotation",
-        "stage3": "relation",
-    }
-    internal = public_to_internal.get(stage_name)
-    if internal is None:
+    if stage_name != "stage3":
         raise HTTPException(status_code=404, detail="Download not found.")
-    if run["stages"][internal].get("status") != "completed":
-        raise HTTPException(status_code=409, detail="This stage is not complete.")
+    if run["stages"]["relation"].get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Stage 3 is not complete.")
+    download_root = _sanitized_download_root(cleaned)
+    policy_headers = {
+        "Cache-Control": "no-store",
+        "X-Entity-Overlap-Policy": ENTITY_OVERLAP_POLICY,
+    }
+
+    if str(run.get("input_mode") or "") == "precomputed":
+        raw_path = run_registry.get_private(cleaned, "precomputed_prediction_path")
+        if not raw_path:
+            raise HTTPException(status_code=404, detail="Saved corpus file not found.")
+        path = Path(str(raw_path)).expanduser().resolve()
+        subset = bool(run_registry.get_private(cleaned, "precomputed_pmid_selection", False))
+        root = (
+            (settings.data_dir / "runs" / cleaned).expanduser().resolve()
+            if subset else corpus_root()
+        )
+        if not path.is_relative_to(root) or not path.is_file():
+            raise HTTPException(status_code=404, detail="Saved corpus file not found.")
+        definition = corpus_definition(str(run.get("corpus_id") or DEFAULT_CORPUS_ID))
+        filename = "precomputed-pmid-results.jsonl" if subset else definition["filename"]
+        destination = download_root / filename
+        sanitize_jsonl_files([path], destination)
+        return FileResponse(
+            destination,
+            media_type="application/x-ndjson",
+            filename=filename,
+            headers=policy_headers,
+        )
+
     refs = pipeline_orchestrator.artifacts_for_download(cleaned, stage_name)
     if not refs:
-        raise HTTPException(status_code=404, detail="Stage artifact not found.")
-    filename = {
-        "stage1": "chunks.jsonl.gz",
-        "stage2": "entity-annotations.jsonl.gz",
-        "stage3": "relations.jsonl.gz",
-    }[stage_name]
-    return StreamingResponse(
-        _artifact_stream(refs),
+        raise HTTPException(
+            status_code=404,
+            detail="The final annotated paper artifact was not found.",
+        )
+
+    sources: list[Path] = []
+    source_root = download_root / "sources"
+    shutil.rmtree(source_root, ignore_errors=True)
+    source_root.mkdir(parents=True, exist_ok=True)
+    for index, raw in enumerate(refs, start=1):
+        ref = ArtifactRef.from_dict(raw)
+        sources.append(
+            _download_source_path(
+                ref,
+                destination=source_root / f"source-{index}.jsonl.gz",
+            )
+        )
+    destination = download_root / "ovarian-metadata-and-annotations.jsonl.gz"
+    sanitize_jsonl_files(sources, destination)
+    return FileResponse(
+        destination,
         media_type="application/gzip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Cache-Control": "no-store",
-        },
+        filename="ovarian-metadata-and-annotations.jsonl.gz",
+        headers={**policy_headers, "Content-Encoding": "identity"},
     )
 
 

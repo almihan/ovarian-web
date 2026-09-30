@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+data/runs
+data/work
+data/artifacts
+data/model_cache
+data/corpus_updates
+data/local_annotation_jobs
+data/relation_jobs
+data/precomputed_corpora/.corpus-store.lock
+data/precomputed_corpora/*.summary.json

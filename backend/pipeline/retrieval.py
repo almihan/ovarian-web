@@ -1,21 +1,25 @@
 """Paper retrieval for the ovarian-network web application.
 
-The pipeline keeps one shared corpus and one reusable chunk file per paper.
+The retrieval engine supports two explicit selection modes:
 
-1. Parse one comma-separated mixed user field containing positive keywords,
-   ``not <term>`` exclusions, PMIDs, and PMCIDs.
-2. Search PubMed once and select at most ``DEFAULT_KEYWORD_LIMIT`` keyword
-   results. Explicit/default PMIDs and PMCIDs are still added to that selection.
-3. Download PubMed metadata only for identifiers not already in the corpus.
-4. Reuse locally stored PMC full text and cached chunks.
-5. Retrieve missing full text with a fast PubTator3 batch request, then use the
-   official NCBI BioC PMC and Europe PMC full-text APIs as per-paper fallbacks.
-6. Cache definitive "not available" results briefly, but keep transient service
-   failures retryable. A retriever-version change automatically rechecks legacy
-   negative cache entries.
-7. Store compact BioC JSON with gzip compression and rebuild only papers that
-   have just been upgraded from abstract-only text.
-8. Stream one combined ``chunks.jsonl`` without storing a duplicate job copy.
+1. ``default_augmented`` keeps the original shared-corpus behavior. It parses a
+   mixed comma-separated field, searches the built-in PubMed query, and combines
+   the search result with the configured default identifiers.
+2. ``explicit_pmids_only`` accepts a comma-separated PMID list and deliberately
+   skips the built-in query, default PMIDs, and default PMCIDs. Every downstream
+   artifact for that run is therefore derived only from the entered PMIDs.
+
+After paper selection, each run also chooses a text mode:
+
+- ``abstract`` downloads PubMed metadata only, makes no PMC full-text request,
+  ignores any cached full text, and annotates the abstract only. A paper with no
+  abstract is retained as a metadata-only row; the title is never annotated.
+- ``fulltext`` uses PMC full text when available, keeps only the canonical TITLE,
+  ABSTRACT, INTRO, RESULTS, DISCUSS, and CONCL sections in the cleaned cache,
+  excludes TITLE from annotation, and falls back to the PubMed abstract only.
+
+Both modes reuse mode-specific chunk caches and stream one combined
+``chunks.jsonl`` without storing a duplicate job copy.
 
 Author metadata is not collected or saved. Cached chunk files are never opened
 for legacy-author cleanup.
@@ -48,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 # UPDATED INPUT PARSER: comma-separated keywords, NOT exclusions, PMIDs, and PMCIDs.
 InputType = Literal["keywords", "pmid", "pmcid"]
+SelectionMode = Literal["default_augmented", "explicit_pmids_only"]
+TextMode = Literal["abstract", "fulltext"]
 ProgressCallback = Callable[[str, int, str, dict[str, Any]], None]
 
 # The legacy input_type argument is retained for API compatibility, but the
@@ -77,7 +83,9 @@ DEFAULT_KEYWORD_LIMIT = 2000
 DEFAULT_REQUEST_TIMEOUT = 30
 MAX_REQUEST_TIMEOUT = 300
 
-# PubTator3 accepts comma-separated PMCIDs and is retained as the fast path.
+# Full-text BioC payloads are much larger than entity-export responses, so the
+# retrieval fast path deliberately uses smaller batches. Stage 2 entity
+# extraction separately uses form-encoded PubTator3 POST batches of 500 papers.
 # Missing documents and service errors are checked through the two per-paper
 # fallback APIs instead of being permanently classified from one batch result.
 FULLTEXT_BATCH_SIZE = 20
@@ -91,6 +99,11 @@ TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 # Visible marker for this rewritten mixed-input implementation.
 INPUT_PARSER_VERSION = "mixed-comma-v2"
+
+# Bump whenever the Stage 1 chunk/export row contract changes. This value is
+# included in cache identities so older rows cannot silently omit metadata or
+# text-source fallback information.
+CHUNK_OUTPUT_VERSION = "paper-chunks-v5-no-title-canonical-sections"
 
 # Curated identifiers retained from the supplied scripts.
 DEFAULT_PMIDS: tuple[str, ...] = (
@@ -500,39 +513,30 @@ _QUERY_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\*?")
 _QUERY_BOOLEAN_WORDS = {"and", "or", "not"}
 _SIMPLE_KEYWORD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+/-]*\*?$")
 
-SKIP_SECTION_EXACT = {
-    "REF",
-    "METHODS",
-    "ABBR",
-    "SUPPL",
-    "COMP_INT",
-    "CASE",
-    "APPENDIX",
-    "ACK_FUND",
-}
-SKIP_SECTION_SUBSTR = {
-    "author",
-    "auth",
-    "affiliation",
-    "correspond",
-    "table",
-    "tabel",
-    "fig",
-    "figure",
-}
-SKIP_TYPE_SUBSTR = {
-    "table",
-    "fig",
-    "figure",
-    "author",
-    "affiliation",
-    "correspond",
-    "ref",
-}
+# Full-text cache rows are normalized to this small, explicit section vocabulary.
+# TITLE is retained as paper metadata/full-text provenance but never becomes an
+# annotation chunk. METHODS and all other sections are deliberately excluded.
+FULLTEXT_SECTION_TYPES = frozenset(
+    {"TITLE", "ABSTRACT", "INTRO", "RESULTS", "DISCUSS", "CONCL"}
+)
+ANNOTATABLE_SECTION_TYPES = FULLTEXT_SECTION_TYPES - {"TITLE"}
+_FULLTEXT_BODY_SECTION_TYPES = ANNOTATABLE_SECTION_TYPES - {"ABSTRACT"}
+_SECTION_TOKEN_RE = re.compile(r"[^A-Z0-9]+")
 
 
 class RetrievalError(RuntimeError):
     """A concise, user-facing retrieval failure."""
+
+
+def normalize_text_mode(value: Any) -> TextMode:
+    """Normalize the requested text source for downstream processing."""
+
+    normalized = re.sub(r"[\s-]+", "_", str(value or "").strip().casefold())
+    if normalized in {"abstract", "abstract_only"}:
+        return "abstract"
+    if normalized in {"fulltext", "full_text", "full_text_when_available"}:
+        return "fulltext"
+    raise RetrievalError("Text source must be either 'abstract' or 'fulltext'.")
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1077,55 @@ def build_effective_inputs(input_type: InputType, raw_user_input: str) -> Effect
     )
 
 
+def build_explicit_pmid_inputs(
+    input_type: InputType,
+    raw_user_input: str,
+) -> EffectiveInputs:
+    """Build an isolated input selection from comma-separated PMIDs only.
+
+    Unlike :func:`build_effective_inputs`, this function does not include the
+    built-in PubMed query, default PMIDs, or default PMCIDs. A PMID that also
+    appears in the built-in seed list is still retained because the requested
+    run must represent exactly the identifiers entered by the user.
+    """
+
+    raw = sanitize_query(raw_user_input)
+    parsed = parse_mixed_user_input(raw_user_input)
+    if not parsed.items:
+        raise RetrievalError(
+            "Enter at least one PMID. Separate multiple PMIDs with commas."
+        )
+    if parsed.keywords or parsed.exclusions or parsed.pmcids:
+        raise RetrievalError(
+            "An isolated PMID run accepts PMIDs only. Enter values such as "
+            "'24042431, 31778080' or 'PMID:24042431, PMID:31778080'."
+        )
+
+    pmids = unique_preserving_order(parsed.pmids)
+    if not pmids:
+        raise RetrievalError(
+            "No valid PMIDs were found. Separate 1- to 9-digit PMIDs with commas."
+        )
+
+    return EffectiveInputs(
+        input_type=input_type,
+        raw_user_input=raw,
+        user_keywords=(),
+        user_exclusions=(),
+        user_keyword_was_redundant=False,
+        pmids=pmids,
+        pmcids=(),
+        user_keyword_count=0,
+        user_exclusion_count=0,
+        user_pmid_count=len(pmids),
+        user_pmcid_count=0,
+        duplicate_user_keyword_count=0,
+        duplicate_user_exclusion_count=0,
+        duplicate_user_pmid_count=max(0, len(parsed.pmids) - len(pmids)),
+        duplicate_user_pmcid_count=0,
+    )
+
+
 def defaults_payload(keyword_limit: int = DEFAULT_KEYWORD_LIMIT) -> dict[str, Any]:
     """Return browser-facing retrieval defaults."""
 
@@ -1096,6 +1149,9 @@ def defaults_payload(keyword_limit: int = DEFAULT_KEYWORD_LIMIT) -> dict[str, An
         "keyword_search_mode": "single_augmented_query_with_exclusions",
         "metadata_reuse": True,
         "metadata_retry_count": METADATA_HTTP_ATTEMPTS - 1,
+        "text_modes": ["abstract", "fulltext"],
+        "default_text_mode": "fulltext",
+        "abstract_mode_uses_fulltext": False,
         "fulltext_batch_retrieval": True,
         "fulltext_fallback_retrieval": True,
         "fulltext_attempt_mode": "retry_transient_refresh_negative_cache",
@@ -1104,6 +1160,10 @@ def defaults_payload(keyword_limit: int = DEFAULT_KEYWORD_LIMIT) -> dict[str, An
         "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
         "fulltext_storage": "compact_bioc_json_gzip",
         "chunk_storage": "jsonl_gzip_streamed_as_ndjson",
+        "chunk_output_version": CHUNK_OUTPUT_VERSION,
+        "fulltext_missing_content_falls_back_to_abstract": True,
+        "selected_text_fallback_order": ["abstract", "title", "metadata_only"],
+        "explicit_pmids_are_never_silently_dropped": True,
         "chunk_reuse_mode": "paper_id_with_fulltext_upgrade",
         "paper_change_checks": False,
     }
@@ -1531,58 +1591,95 @@ def xml_text(element: ET.Element | None) -> str:
     return clean_text("".join(element.itertext())) if element is not None else ""
 
 
+def _year_from_pubdate(pubdate: ET.Element | None) -> str | None:
+    if pubdate is None:
+        return None
+    year = xml_text(pubdate.find("Year"))
+    if year:
+        return year
+    medline_date = xml_text(pubdate.find("MedlineDate"))
+    if medline_date:
+        match = re.search(r"\b(18|19|20)\d{2}\b", medline_date)
+        if match:
+            return match.group(0)
+    return None
+
+
+def _abstract_text(container: ET.Element | None) -> str:
+    if container is None:
+        return ""
+    parts: list[str] = []
+    for abstract_element in container.findall("./Abstract/AbstractText"):
+        text = xml_text(abstract_element)
+        if not text:
+            continue
+        label = clean_text(
+            abstract_element.attrib.get("Label")
+            or abstract_element.attrib.get("NlmCategory")
+        )
+        parts.append(f"{label}: {text}" if label else text)
+    return "\n\n".join(parts)
+
+
+def _pubmed_identifiers(record_root: ET.Element) -> dict[str, str]:
+    identifiers: dict[str, str] = {}
+    paths = (
+        "./PubmedData/ArticleIdList/ArticleId",
+        "./PubmedBookData/ArticleIdList/ArticleId",
+    )
+    for path in paths:
+        for identifier in record_root.findall(path):
+            id_type = clean_text(identifier.attrib.get("IdType")).lower()
+            value = clean_text(identifier.text)
+            if id_type and value:
+                identifiers[id_type] = value
+    return identifiers
+
+
 def parse_pubmed_xml(xml_bytes: bytes) -> list[dict[str, Any]]:
+    """Parse both journal articles and PubMed book records from EFetch XML."""
+
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:
         raise RetrievalError("PubMed returned malformed XML metadata.") from exc
 
     records: list[dict[str, Any]] = []
-    for article_root in root.findall(".//PubmedArticle"):
-        citation = article_root.find("./MedlineCitation")
-        article = article_root.find("./MedlineCitation/Article")
-        if citation is None:
+    record_roots = [
+        *root.findall(".//PubmedArticle"),
+        *root.findall(".//PubmedBookArticle"),
+    ]
+    for record_root in record_roots:
+        citation = record_root.find("./MedlineCitation")
+        article = citation.find("./Article") if citation is not None else None
+        book_document = record_root.find("./BookDocument")
+
+        if citation is not None:
+            pmid = normalize_pmid(citation.findtext("PMID"))
+            title = xml_text(article.find("ArticleTitle") if article is not None else None)
+            abstract = _abstract_text(article)
+            journal = ""
+            pub_year: str | None = None
+            if article is not None:
+                journal_element = article.find("Journal")
+                if journal_element is not None:
+                    journal = xml_text(journal_element.find("Title"))
+                    pub_year = _year_from_pubdate(
+                        journal_element.find("./JournalIssue/PubDate")
+                    )
+        elif book_document is not None:
+            pmid = normalize_pmid(book_document.findtext("PMID"))
+            title = xml_text(book_document.find("ArticleTitle"))
+            abstract = _abstract_text(book_document)
+            book = book_document.find("Book")
+            journal = xml_text(book.find("BookTitle") if book is not None else None)
+            pub_year = _year_from_pubdate(
+                book.find("PubDate") if book is not None else None
+            )
+        else:
             continue
 
-        pmid = normalize_pmid(citation.findtext("PMID"))
-        title = xml_text(article.find("ArticleTitle") if article is not None else None)
-
-        abstract_parts: list[str] = []
-        if article is not None:
-            for abstract_element in article.findall("./Abstract/AbstractText"):
-                text = xml_text(abstract_element)
-                if not text:
-                    continue
-                label = clean_text(
-                    abstract_element.attrib.get("Label")
-                    or abstract_element.attrib.get("NlmCategory")
-                )
-                abstract_parts.append(f"{label}: {text}" if label else text)
-
-        journal = ""
-        pub_year: str | None = None
-        if article is not None:
-            journal_element = article.find("Journal")
-            if journal_element is not None:
-                journal = xml_text(journal_element.find("Title"))
-                year = xml_text(journal_element.find("./JournalIssue/PubDate/Year"))
-                medline_date = xml_text(
-                    journal_element.find("./JournalIssue/PubDate/MedlineDate")
-                )
-                if year:
-                    pub_year = year
-                elif medline_date:
-                    match = re.search(r"\b(18|19|20)\d{2}\b", medline_date)
-                    pub_year = match.group(0) if match else None
-
-
-        identifiers: dict[str, str] = {}
-        for identifier in article_root.findall("./PubmedData/ArticleIdList/ArticleId"):
-            id_type = clean_text(identifier.attrib.get("IdType")).lower()
-            value = clean_text(identifier.text)
-            if id_type and value:
-                identifiers[id_type] = value
-
+        identifiers = _pubmed_identifiers(record_root)
         records.append(
             {
                 "source": "pubmed",
@@ -1591,7 +1688,7 @@ def parse_pubmed_xml(xml_bytes: bytes) -> list[dict[str, Any]]:
                 "pmcid": normalize_pmcid(identifiers.get("pmc")),
                 "doi": normalize_doi(identifiers.get("doi")),
                 "title": title,
-                "abstract": "\n\n".join(abstract_parts),
+                "abstract": abstract,
                 "journal": journal,
                 "pub_year": pub_year,
                 "sources": ["pubmed"],
@@ -1599,11 +1696,39 @@ def parse_pubmed_xml(xml_bytes: bytes) -> list[dict[str, Any]]:
         )
     return records
 
-
 def batched(values: Sequence[str], size: int) -> Iterator[Sequence[str]]:
     safe_size = max(1, int(size))
     for start in range(0, len(values), safe_size):
         yield values[start : start + safe_size]
+
+
+def _fetch_pubmed_metadata_batch(
+    session: requests.Session,
+    pacer: RequestPacer,
+    *,
+    pmids: Sequence[str],
+    email: str,
+    tool: str,
+    api_key: str | None,
+    timeout: int,
+    context: str,
+) -> list[dict[str, Any]]:
+    params = {
+        "db": "pubmed",
+        "id": ",".join(pmids),
+        "retmode": "xml",
+        **ncbi_params(email, tool, api_key),
+    }
+    response = perform_request_with_retries(
+        session,
+        "GET",
+        PUBMED_EFETCH,
+        context=context,
+        timeout=timeout,
+        pacer=pacer,
+        params=params,
+    )
+    return parse_pubmed_xml(response.content)
 
 
 def fetch_pubmed_records(
@@ -1620,24 +1745,100 @@ def fetch_pubmed_records(
     total = len(pmids)
     processed = 0
     for batch in batched(pmids, min(max(1, batch_size), 200)):
-        params = {
-            "db": "pubmed",
-            "id": ",".join(batch),
-            "retmode": "xml",
-            **ncbi_params(email, tool, api_key),
-        }
-        response = perform_request_with_retries(
+        records = _fetch_pubmed_metadata_batch(
             session,
-            "GET",
-            PUBMED_EFETCH,
-            context="PubMed metadata download",
+            pacer,
+            pmids=batch,
+            email=email,
+            tool=tool,
+            api_key=api_key,
             timeout=timeout,
-            pacer=pacer,
-            params=params,
+            context="PubMed metadata download",
         )
-        records = parse_pubmed_xml(response.content)
+
+        # A successful batch response can still omit an identifier. Make one
+        # bounded repair request for only the missing IDs before falling back to
+        # Europe PMC or a metadata-only placeholder.
+        returned_pmids = {
+            pmid
+            for record in records
+            if (pmid := normalize_pmid(record.get("pmid")))
+        }
+        missing = [pmid for pmid in batch if pmid not in returned_pmids]
+        if missing:
+            repaired = _fetch_pubmed_metadata_batch(
+                session,
+                pacer,
+                pmids=missing,
+                email=email,
+                tool=tool,
+                api_key=api_key,
+                timeout=timeout,
+                context="PubMed metadata repair",
+            )
+            by_pmid = {
+                pmid: record
+                for record in records
+                if (pmid := normalize_pmid(record.get("pmid")))
+            }
+            for record in repaired:
+                pmid = normalize_pmid(record.get("pmid"))
+                if pmid:
+                    by_pmid[pmid] = record
+            records = [by_pmid[pmid] for pmid in batch if pmid in by_pmid]
+
         processed += len(batch)
         yield records, processed, total
+
+def _epmc_result_record(result: dict[str, Any]) -> dict[str, Any]:
+    """Convert one Europe PMC core result to the shared paper metadata contract."""
+
+    return {
+        "source": "europepmc",
+        "source_id": clean_text(result.get("id")),
+        "pmid": normalize_pmid(result.get("pmid") or result.get("id")),
+        "pmcid": normalize_pmcid(result.get("pmcid")),
+        "doi": normalize_doi(result.get("doi")),
+        "title": clean_text(result.get("title")),
+        "abstract": clean_text(result.get("abstractText")),
+        "journal": clean_text(result.get("journalTitle")),
+        "pub_year": clean_text(result.get("pubYear")) or None,
+        "sources": ["europepmc"],
+    }
+
+
+def _fetch_epmc_core_results(
+    session: requests.Session,
+    *,
+    query: str,
+    page_size: int,
+    timeout: int,
+    context: str,
+) -> list[dict[str, Any]]:
+    params = {
+        "query": query,
+        "format": "json",
+        "resultType": "core",
+        "pageSize": str(max(1, page_size)),
+        "synonym": "FALSE",
+    }
+    response = perform_request_with_retries(
+        session,
+        "GET",
+        EPMC_SEARCH,
+        context=context,
+        timeout=timeout,
+        params=params,
+    )
+    try:
+        results = (response.json().get("resultList") or {}).get("result") or []
+    except (ValueError, AttributeError, json.JSONDecodeError) as exc:
+        raise RetrievalError("Europe PMC returned unreadable identifier metadata.") from exc
+    return [
+        _epmc_result_record(result)
+        for result in results
+        if isinstance(result, dict)
+    ]
 
 
 def fetch_epmc_records_for_pmcids(
@@ -1647,41 +1848,31 @@ def fetch_epmc_records_for_pmcids(
     timeout: int,
 ) -> Iterator[list[dict[str, Any]]]:
     for batch in batched(pmcids, 40):
-        params = {
-            "query": " OR ".join(f'PMCID:"{pmcid}"' for pmcid in batch),
-            "format": "json",
-            "resultType": "core",
-            "pageSize": str(len(batch)),
-            "synonym": "FALSE",
-        }
-        response = perform_request_with_retries(
+        yield _fetch_epmc_core_results(
             session,
-            "GET",
-            EPMC_SEARCH,
-            context="Europe PMC identifier lookup",
+            query=" OR ".join(f'PMCID:"{pmcid}"' for pmcid in batch),
+            page_size=len(batch),
             timeout=timeout,
-            params=params,
+            context="Europe PMC identifier lookup",
         )
-        try:
-            results = (response.json().get("resultList") or {}).get("result") or []
-        except (ValueError, AttributeError, json.JSONDecodeError) as exc:
-            raise RetrievalError("Europe PMC returned unreadable identifier metadata.") from exc
 
-        yield [
-            {
-                "source": "europepmc",
-                "source_id": clean_text(result.get("id")),
-                "pmid": normalize_pmid(result.get("pmid")),
-                "pmcid": normalize_pmcid(result.get("pmcid")),
-                "doi": normalize_doi(result.get("doi")),
-                "title": clean_text(result.get("title")),
-                "abstract": clean_text(result.get("abstractText")),
-                "journal": clean_text(result.get("journalTitle")),
-                "pub_year": clean_text(result.get("pubYear")) or None,
-                "sources": ["europepmc"],
-            }
-            for result in results
-        ]
+
+def fetch_epmc_records_for_pmids(
+    session: requests.Session,
+    *,
+    pmids: Sequence[str],
+    timeout: int,
+) -> Iterator[list[dict[str, Any]]]:
+    """Recover missing abstracts for MEDLINE/PubMed identifiers through Europe PMC."""
+
+    for batch in batched(pmids, 40):
+        yield _fetch_epmc_core_results(
+            session,
+            query=" OR ".join(f"(EXT_ID:{pmid} AND SRC:MED)" for pmid in batch),
+            page_size=len(batch),
+            timeout=timeout,
+            context="Europe PMC PMID abstract lookup",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1801,6 +1992,8 @@ def _passage_infons(passage: dict[str, Any]) -> dict[str, Any]:
 
 
 def _passage_section_type(passage: dict[str, Any]) -> str:
+    """Return the first source-provided section label without normalizing it."""
+
     infons = _passage_infons(passage)
     for key in (
         "section_type",
@@ -1824,14 +2017,67 @@ def _passage_type(passage: dict[str, Any]) -> str:
     return ""
 
 
-def _document_has_fulltext(document: dict[str, Any]) -> bool:
-    """Return true only when a BioC document contains body-level text."""
+def _canonical_section_label(*values: Any) -> str:
+    """Map heterogeneous BioC/JATS labels to the six project section names."""
 
-    nonempty_passages = 0
-    total_characters = 0
-    unknown_characters = 0
-    body_types = {"paragraph", "paragrpah", "body", "text", "section", "subsection"}
-    nonbody_sections = {"", "UNKNOWN", "TITLE", "ABSTRACT", "FRONT", "META"}
+    direct = {
+        "TITLE": "TITLE",
+        "ABSTRACT": "ABSTRACT",
+        "INTRO": "INTRO",
+        "INTRODUCTION": "INTRO",
+        "BACKGROUND": "INTRO",
+        "RESULT": "RESULTS",
+        "RESULTS": "RESULTS",
+        "FINDING": "RESULTS",
+        "FINDINGS": "RESULTS",
+        "DISCUSS": "DISCUSS",
+        "DISCUSSION": "DISCUSS",
+        "CONCL": "CONCL",
+        "CONCLUSION": "CONCL",
+        "CONCLUSIONS": "CONCL",
+    }
+    for raw_value in values:
+        normalized = _SECTION_TOKEN_RE.sub(
+            " ", clean_text(raw_value).upper()
+        ).strip()
+        if not normalized:
+            continue
+        if normalized in direct:
+            return direct[normalized]
+        tokens = set(normalized.split())
+        if "TITLE" in tokens:
+            return "TITLE"
+        if "ABSTRACT" in tokens:
+            return "ABSTRACT"
+        # Combined Results/Discussion sections are kept as RESULTS so the
+        # section is retained without creating a non-project label.
+        if any(token.startswith("RESULT") or token.startswith("FINDING") for token in tokens):
+            return "RESULTS"
+        if any(token.startswith("DISCUSS") for token in tokens):
+            return "DISCUSS"
+        if any(token.startswith("CONCL") for token in tokens):
+            return "CONCL"
+        if any(token.startswith("INTRO") for token in tokens) or "BACKGROUND" in tokens:
+            return "INTRO"
+    return ""
+
+
+def _canonical_passage_section_type(passage: dict[str, Any]) -> str:
+    infons = _passage_infons(passage)
+    return _canonical_section_label(
+        infons.get("section_type"),
+        infons.get("sectionType"),
+        infons.get("section"),
+        infons.get("section_name"),
+        infons.get("sectionName"),
+        infons.get("type"),
+        infons.get("passage_type"),
+        infons.get("passageType"),
+    )
+
+
+def _document_has_fulltext(document: dict[str, Any]) -> bool:
+    """Return true only when a selected body section is present."""
 
     for passage in document.get("passages") or document.get("passage") or []:
         if not isinstance(passage, dict):
@@ -1839,27 +2085,9 @@ def _document_has_fulltext(document: dict[str, Any]) -> bool:
         raw_text = passage.get("text")
         if not isinstance(raw_text, str) or not raw_text.strip():
             continue
-        nonempty_passages += 1
-        total_characters += len(raw_text)
-        section = _passage_section_type(passage).upper()
-        passage_type = _passage_type(passage).lower()
-
-        if section in {"TITLE", "ABSTRACT", "FRONT", "META"}:
-            continue
-        if passage_type in body_types:
+        if _canonical_passage_section_type(passage) in _FULLTEXT_BODY_SECTION_TYPES:
             return True
-        if section not in nonbody_sections:
-            return True
-        if section == "UNKNOWN" and passage_type not in {"title", "abstract", "front"}:
-            unknown_characters += len(raw_text)
-
-    # Some BioC producers omit section/type infons. Multiple substantial
-    # passages are still distinguishable from a title-and-abstract response.
-    return (
-        nonempty_passages >= 3
-        and total_characters >= 1000
-        and unknown_characters >= 400
-    )
+    return False
 
 
 def _strict_pmcid(value: Any, *, key_implies_pmcid: bool = False) -> str | None:
@@ -1940,37 +2168,26 @@ def _document_pmcid(
 
 
 def _compact_passage(passage: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep one cleaned passage only when it maps to the project vocabulary."""
+
     raw_text = passage.get("text")
     if not isinstance(raw_text, str) or not raw_text.strip():
         return None
 
-    infons = _passage_infons(passage)
-    compact_infons: dict[str, Any] = {}
-    section_type = _passage_section_type(passage)
+    section_type = _canonical_passage_section_type(passage)
+    if section_type not in FULLTEXT_SECTION_TYPES:
+        return None
+
+    compact_infons: dict[str, Any] = {"section_type": section_type}
     passage_type = _passage_type(passage)
-    if section_type and section_type != "UNKNOWN":
-        compact_infons["section_type"] = section_type
     if passage_type:
         compact_infons["type"] = passage_type
 
-    # Preserve a human-readable section name when it differs from the broad
-    # section type. No annotations or relations are retained.
-    for key in ("section", "section_name", "sectionName"):
-        value = clean_text(infons.get(key))
-        if value and value != section_type:
-            compact_infons["section"] = value
-            break
-
-    compact: dict[str, Any] = {
+    return {
         "offset": passage.get("offset", 0),
         "infons": compact_infons,
         "text": raw_text,
     }
-    if isinstance(passage.get("sentences"), list):
-        # Sentences are deliberately omitted: passage text is sufficient for the
-        # retrieval-stage chunker and avoids duplicating the same text.
-        pass
-    return compact
 
 
 def _compact_bioc_document(
@@ -2197,23 +2414,9 @@ def _nearest_section_title(
 
 
 def _jats_section_type(section_title: str) -> str:
-    normalized = clean_text(section_title).casefold()
-    if not normalized:
-        return "BODY"
-    mappings = (
-        (("introduction", "background"), "INTRO"),
-        (("method", "material", "experimental"), "METHODS"),
-        (("result", "finding"), "RESULTS"),
-        (("discussion",), "DISCUSSION"),
-        (("conclusion",), "CONCLUSION"),
-        (("case report", "case presentation"), "CASE"),
-        (("supplement",), "SUPPLEMENT"),
-        (("reference", "bibliograph"), "REFERENCES"),
-    )
-    for needles, label in mappings:
-        if any(needle in normalized for needle in needles):
-            return label
-    return "BODY"
+    """Map a JATS heading to the project's canonical section vocabulary."""
+
+    return _canonical_section_label(section_title)
 
 
 def _element_has_skipped_ancestor(
@@ -2251,22 +2454,35 @@ def _parse_epmc_fulltext_xml(content: bytes, *, pmcid: str) -> bytes | None:
     passages: list[dict[str, Any]] = []
     offset = 0
 
-    def append_passage(text: str, section_type: str, passage_type: str, section: str = "") -> None:
+    def append_passage(
+        text: str,
+        section_type: str,
+        passage_type: str,
+    ) -> bool:
         nonlocal offset
-        text = text.strip()
-        if not text:
-            return
-        infons: dict[str, Any] = {
-            "section_type": section_type,
-            "type": passage_type,
-        }
-        if section and section.upper() != section_type:
-            infons["section"] = section
-        passages.append({"offset": offset, "infons": infons, "text": text})
-        offset += len(text) + 2
+        cleaned = text.strip()
+        canonical_section = _canonical_section_label(section_type, passage_type)
+        if not cleaned or canonical_section not in FULLTEXT_SECTION_TYPES:
+            return False
+        passages.append(
+            {
+                "offset": offset,
+                "infons": {
+                    "section_type": canonical_section,
+                    "type": passage_type,
+                },
+                "text": cleaned,
+            }
+        )
+        offset += len(cleaned) + 2
+        return True
 
     article_title = next(
-        (xml_text(element) for element in root.iter() if _xml_local_name(element.tag) == "article-title"),
+        (
+            xml_text(element)
+            for element in root.iter()
+            if _xml_local_name(element.tag) == "article-title"
+        ),
         "",
     )
     append_passage(article_title, "TITLE", "title")
@@ -2279,36 +2495,38 @@ def _parse_epmc_fulltext_xml(content: bytes, *, pmcid: str) -> bytes | None:
         paragraph_elements = [
             element for element in abstract.iter() if _xml_local_name(element.tag) == "p"
         ]
-        if paragraph_elements:
-            for paragraph in paragraph_elements:
-                text = xml_text(paragraph)
-                identity = text.casefold()
-                if text and identity not in seen_abstract_texts:
-                    seen_abstract_texts.add(identity)
-                    append_passage(text, "ABSTRACT", "abstract")
-        else:
-            text = xml_text(abstract)
-            identity = text.casefold()
-            if text and identity not in seen_abstract_texts:
+        candidates = paragraph_elements or [abstract]
+        for candidate in candidates:
+            abstract_text = xml_text(candidate)
+            identity = abstract_text.casefold()
+            if abstract_text and identity not in seen_abstract_texts:
                 seen_abstract_texts.add(identity)
-                append_passage(text, "ABSTRACT", "abstract")
+                append_passage(abstract_text, "ABSTRACT", "abstract")
 
-    body_elements = [element for element in root.iter() if _xml_local_name(element.tag) == "body"]
-    body_paragraph_count = 0
+    body_elements = [
+        element for element in root.iter() if _xml_local_name(element.tag) == "body"
+    ]
+    selected_body_paragraph_count = 0
     for body in body_elements:
         for paragraph in body.iter():
             if _xml_local_name(paragraph.tag) != "p":
                 continue
             if _element_has_skipped_ancestor(paragraph, parent_map):
                 continue
-            text = xml_text(paragraph)
-            if not text:
+            paragraph_text = xml_text(paragraph)
+            if not paragraph_text:
                 continue
-            section = _nearest_section_title(paragraph, parent_map)
-            append_passage(text, _jats_section_type(section), "paragraph", section)
-            body_paragraph_count += 1
+            section_type = _jats_section_type(
+                _nearest_section_title(paragraph, parent_map)
+            )
+            if section_type not in _FULLTEXT_BODY_SECTION_TYPES:
+                continue
+            if append_passage(paragraph_text, section_type, "paragraph"):
+                selected_body_paragraph_count += 1
 
-    if body_paragraph_count == 0:
+    # A full-text result must contain at least one selected body section. A title
+    # and abstract alone are handled by the normal PubMed abstract fallback.
+    if selected_body_paragraph_count == 0:
         return None
     document = {"id": pmcid, "infons": {"pmcid": pmcid}, "passages": passages}
     return _serialize_compact_bioc_document(document, pmcid=pmcid)
@@ -2558,6 +2776,8 @@ def should_attempt_fulltext(
     return age >= dt.timedelta(days=FULLTEXT_NEGATIVE_CACHE_DAYS)
 
 def iter_bioc_passages(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield only canonical full-text passages from a cached BioC document."""
+
     try:
         if path.suffix.casefold() == ".gz":
             with gzip.open(path, "rt", encoding="utf-8") as handle:
@@ -2575,51 +2795,26 @@ def iter_bioc_passages(path: Path) -> Iterator[dict[str, Any]]:
             raw_text = passage.get("text")
             if not isinstance(raw_text, str) or not raw_text.strip():
                 continue
-            infons = passage.get("infons")
-            if not isinstance(infons, dict):
-                infons = {}
+            section_type = _canonical_passage_section_type(passage)
+            if section_type not in FULLTEXT_SECTION_TYPES:
+                continue
             yield {
                 "text": raw_text,
-                "section_type": _passage_section_type(passage),
+                "section_type": section_type,
                 "passage_type": _passage_type(passage),
-                "infons": infons,
+                "infons": _passage_infons(passage),
             }
 
 
 def should_keep_passage(passage: dict[str, Any]) -> bool:
-    section = clean_text(passage.get("section_type"))
-    passage_type = clean_text(passage.get("passage_type"))
-    infons = passage.get("infons") or {}
-    section_upper = section.upper()
-    section_lower = section.lower()
-    type_lower = passage_type.lower()
+    """Return true only for annotatable canonical sections (never TITLE)."""
 
-    if section_upper in SKIP_SECTION_EXACT:
-        return False
-    if any(token in section_lower for token in SKIP_SECTION_SUBSTR):
-        return False
-    if any(token in type_lower for token in SKIP_TYPE_SUBSTR):
-        return False
-    if any(
-        str(key).lower().startswith(("name_", "aff_"))
-        or "affiliation" in str(key).lower()
-        or "orcid" in str(key).lower()
-        for key in infons
-    ):
-        return False
-    if section_upper == "ABSTRACT":
-        return type_lower in {"abstract", "paragraph", ""}
-    if section_upper == "TITLE":
-        return type_lower in {"title", "front", ""}
-    return type_lower in {
-        "paragraph",
-        "paragrpah",
-        "body",
-        "text",
-        "section",
-        "subsection",
-        "",
-    }
+    section_type = _canonical_section_label(
+        passage.get("section_type"),
+        passage.get("passage_type"),
+        *(_passage_infons(passage).values()),
+    )
+    return section_type in ANNOTATABLE_SECTION_TYPES
 
 
 def sanitize_chunk_text(text: str) -> str:
@@ -2677,8 +2872,16 @@ def cached_chunk_path(
     record: dict[str, Any],
     *,
     chunks_dir: Path,
+    text_mode: TextMode = "fulltext",
 ) -> Path:
-    return chunks_dir / _paper_cache_key(record) / "chunks.jsonl.gz"
+    mode = normalize_text_mode(text_mode)
+    return (
+        chunks_dir
+        / CHUNK_OUTPUT_VERSION
+        / mode
+        / _paper_cache_key(record)
+        / "chunks.jsonl.gz"
+    )
 
 
 class ChunkCacheIndex:
@@ -2830,31 +3033,56 @@ def build_paper_chunks(
     *,
     papers_root: Path,
     output_path: Path,
+    text_mode: TextMode = "fulltext",
 ) -> int:
-    """Build exactly one paper's chunk file atomically."""
+    """Build exactly one paper's selected-text chunk file atomically.
 
+    ``abstract`` mode never reads a cached PMC file and emits only the PubMed
+    abstract (or one metadata-only row when no abstract exists). ``fulltext``
+    mode emits only ABSTRACT, INTRO, RESULTS, DISCUSS, and CONCL chunks from a
+    usable full text. TITLE is retained as paper metadata but is never annotated.
+    If no selected full-text passage is available, the PubMed abstract is used.
+    """
+
+    mode = normalize_text_mode(text_mode)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(output_path.name + ".tmp")
     rows_written = 0
     doc_key = safe_doc_key(record)
-    paper_metadata = {
-        key: value
-        for key, value in {
-            "title": clean_text(record.get("title")) or None,
-            "doi": record.get("doi"),
-            "sources": record.get("sources") or None,
-        }.items()
-        if value not in (None, "", [])
+
+    metadata_base = {
+        "canonical_id": record.get("canonical_id"),
+        "pmid": record.get("pmid"),
+        "pmcid": record.get("pmcid"),
+        "title": clean_text(record.get("title")) or None,
+        "abstract": clean_text(record.get("abstract")) or None,
+        "journal": clean_text(record.get("journal")) or None,
+        "pub_year": record.get("pub_year"),
+        "doi": record.get("doi"),
+        "sources": record.get("sources") or None,
+        "text_mode": mode,
+        "fulltext_checked": (
+            bool(record.get("fulltext_checked"))
+            if "fulltext_checked" in record
+            else None
+        ),
+        "fulltext_status": clean_text(record.get("fulltext_status")) or None,
+        "fulltext_source": clean_text(record.get("fulltext_source")) or None,
+        "fulltext_checked_at": clean_text(record.get("fulltext_checked_at")) or None,
+        "fulltext_retriever_version": (
+            clean_text(record.get("fulltext_retriever_version")) or None
+        ),
+        "chunk_output_version": CHUNK_OUTPUT_VERSION,
     }
 
     def write_chunks(output: Any) -> None:
         nonlocal rows_written
 
-        def write_chunk(section_type: str, text: str) -> None:
+        def write_chunk(section_type: str, text: str, text_source: str) -> None:
             nonlocal rows_written
             chunk_id = rows_written + 1
             row: dict[str, Any] = {
-                "base": make_chunk_base(doc_key, chunk_id),
+                "base": make_chunk_base(f"{doc_key}:{mode}", chunk_id),
                 "doc_key": doc_key,
                 "canonical_id": record.get("canonical_id"),
                 "pmid": record.get("pmid"),
@@ -2863,29 +3091,55 @@ def build_paper_chunks(
                 "pub_year": record.get("pub_year"),
                 "section_type": section_type,
                 "chunk_id": chunk_id,
+                "text_mode": mode,
+                "text_source": text_source,
+                "chunk_schema": CHUNK_OUTPUT_VERSION,
                 "chunk": text,
             }
-            if chunk_id == 1 and paper_metadata:
-                row["paper_metadata"] = paper_metadata
+            if chunk_id == 1:
+                metadata = {
+                    **metadata_base,
+                    "selected_text_source": text_source,
+                }
+                row["paper_metadata"] = {
+                    key: value
+                    for key, value in metadata.items()
+                    if value not in (None, "", [], {})
+                }
             output.write(json.dumps(row, ensure_ascii=False) + "\n")
             rows_written += 1
+
+        if mode == "abstract":
+            abstract = sanitize_chunk_text(clean_text(record.get("abstract")))
+            if abstract:
+                write_chunk("ABSTRACT", abstract, "abstract")
+            else:
+                # Preserve the requested PMID without annotating its title or
+                # inventing biomedical text when PubMed has no abstract.
+                write_chunk("METADATA", "", "metadata_only_no_abstract")
+            return
 
         fulltext_path = _resolve_fulltext_path(record, papers_root)
         if fulltext_path is not None:
             for passage in iter_bioc_passages(fulltext_path):
                 if not should_keep_passage(passage):
                     continue
-                text = sanitize_chunk_text(passage["text"])
-                if text:
-                    write_chunk(passage["section_type"], text)
+                passage_text = sanitize_chunk_text(passage["text"])
+                if passage_text:
+                    write_chunk(passage["section_type"], passage_text, "fulltext")
 
+        # A PMCID or cached full-text marker does not guarantee usable content.
+        # Fall back to the PubMed abstract only; TITLE remains metadata and is
+        # never sent to entity or relation extraction.
         if rows_written == 0:
-            title = sanitize_chunk_text(clean_text(record.get("title")))
             abstract = sanitize_chunk_text(clean_text(record.get("abstract")))
-            if title:
-                write_chunk("TITLE", title)
             if abstract:
-                write_chunk("ABSTRACT", abstract)
+                write_chunk("ABSTRACT", abstract, "abstract_fallback")
+            else:
+                # A valid PMID can exist without downloadable full text or an
+                # abstract. Preserve one metadata-only row so the paper is not
+                # silently dropped from Stage 2, Stage 3, or the final download.
+                write_chunk("METADATA", "", "metadata_only_no_abstract")
 
     try:
         if output_path.suffix.casefold() == ".gz":
@@ -2915,7 +3169,6 @@ def build_paper_chunks(
         output_path.with_suffix("").unlink(missing_ok=True)
     return rows_written
 
-
 def prepare_cached_chunks(
     records: Sequence[dict[str, Any]],
     *,
@@ -2924,10 +3177,12 @@ def prepare_cached_chunks(
     cache_index: ChunkCacheIndex,
     new_canonical_ids: set[str],
     rebuild_canonical_ids: set[str] | None = None,
+    text_mode: TextMode = "fulltext",
     on_progress: Callable[[int, int, dict[str, int]], None] | None = None,
 ) -> tuple[tuple[Path, ...], dict[str, int]]:
-    """Reuse chunks, generate new papers, and rebuild repaired full-text papers."""
+    """Reuse or generate one cache file per paper and selected text mode."""
 
+    mode = normalize_text_mode(text_mode)
     rebuild_ids = rebuild_canonical_ids or set()
     counters = {
         "chunk_papers_reused": 0,
@@ -2935,6 +3190,7 @@ def prepare_cached_chunks(
         "chunk_papers_rebuilt_fulltext": 0,
         "chunk_papers_missing_cache": 0,
         "chunk_papers_regenerated_missing_cache": 0,
+        "chunk_papers_regenerated_empty_cache": 0,
         "chunk_rows_reused": 0,
         "chunk_rows_generated": 0,
         "chunks_written": 0,
@@ -2951,13 +3207,18 @@ def prepare_cached_chunks(
             canonical_id = CorpusStore.new_canonical_id(record)
             record["canonical_id"] = canonical_id
 
-        force_fulltext_rebuild = canonical_id in rebuild_ids
+        cache_identity = f"{CHUNK_OUTPUT_VERSION}:{mode}:{canonical_id}"
+        force_fulltext_rebuild = mode == "fulltext" and canonical_id in rebuild_ids
         output_path: Path | None = None
         cached_count = 0
 
         if not force_fulltext_rebuild:
-            preferred_path = cached_chunk_path(record, chunks_dir=chunks_dir).resolve()
-            for cached in cache_index.candidates(canonical_id):
+            preferred_path = cached_chunk_path(
+                record,
+                chunks_dir=chunks_dir,
+                text_mode=mode,
+            ).resolve()
+            for cached in cache_index.candidates(cache_identity):
                 raw_path = clean_text(cached.get("chunk_path"))
                 if not raw_path:
                     continue
@@ -2984,11 +3245,16 @@ def prepare_cached_chunks(
                 )
 
         if force_fulltext_rebuild:
-            output_path = cached_chunk_path(record, chunks_dir=chunks_dir).resolve()
+            output_path = cached_chunk_path(
+                record,
+                chunks_dir=chunks_dir,
+                text_mode=mode,
+            ).resolve()
             chunk_count = build_paper_chunks(
                 record,
                 papers_root=papers_root,
                 output_path=output_path,
+                text_mode=mode,
             )
             if canonical_id in new_canonical_ids:
                 counters["chunk_papers_generated_new"] += 1
@@ -2997,36 +3263,57 @@ def prepare_cached_chunks(
             counters["chunk_rows_generated"] += chunk_count
         elif output_path is not None:
             chunk_count = cached_count or count_jsonl_rows(output_path)
-            counters["chunk_papers_reused"] += 1
-            counters["chunk_rows_reused"] += chunk_count
+            if chunk_count <= 0:
+                output_path = preferred_path
+                chunk_count = build_paper_chunks(
+                    record,
+                    papers_root=papers_root,
+                    output_path=output_path,
+                    text_mode=mode,
+                )
+                counters["chunk_papers_regenerated_empty_cache"] += 1
+                counters["chunk_rows_generated"] += chunk_count
+            else:
+                counters["chunk_papers_reused"] += 1
+                counters["chunk_rows_reused"] += chunk_count
         elif canonical_id in new_canonical_ids:
-            output_path = cached_chunk_path(record, chunks_dir=chunks_dir).resolve()
+            output_path = cached_chunk_path(
+                record,
+                chunks_dir=chunks_dir,
+                text_mode=mode,
+            ).resolve()
             chunk_count = build_paper_chunks(
                 record,
                 papers_root=papers_root,
                 output_path=output_path,
+                text_mode=mode,
             )
             counters["chunk_papers_generated_new"] += 1
             counters["chunk_rows_generated"] += chunk_count
         else:
             counters["chunk_papers_missing_cache"] += 1
-            output_path = cached_chunk_path(record, chunks_dir=chunks_dir).resolve()
+            output_path = cached_chunk_path(
+                record,
+                chunks_dir=chunks_dir,
+                text_mode=mode,
+            ).resolve()
             chunk_count = build_paper_chunks(
                 record,
                 papers_root=papers_root,
                 output_path=output_path,
+                text_mode=mode,
             )
             counters["chunk_papers_regenerated_missing_cache"] += 1
             counters["chunk_rows_generated"] += chunk_count
 
         relative_path = str(output_path.relative_to(papers_root_resolved))
         cache_index.upsert(
-            canonical_id=canonical_id,
+            canonical_id=cache_identity,
             chunk_path=relative_path,
             chunk_count=chunk_count,
         )
         counters["chunks_written"] += chunk_count
-        if output_path not in seen_paths:
+        if chunk_count > 0 and output_path not in seen_paths:
             chunk_paths.append(output_path)
             seen_paths.add(output_path)
 
@@ -3086,12 +3373,16 @@ def run_paper_retrieval(
     exclude_pmids: Sequence[str] = (),
     exclude_pmcids: Sequence[str] = (),
     exclude_canonical_ids: Sequence[str] = (),
+    selection_mode: SelectionMode = "default_augmented",
+    text_mode: TextMode = "fulltext",
 ) -> RetrievalResult:
-    """Retrieve papers while reusing metadata, full text, and chunk caches.
+    """Retrieve papers and build chunks from the selected text source.
 
-    Missing full text is checked through multiple official endpoints. Definitive
-    negative results are cached for a limited period; transient failures remain
-    eligible for the next job rather than becoming permanent abstract-only rows.
+    Abstract mode never initializes or calls a full-text client and writes only
+    an abstract chunk (or one metadata-only row when no abstract exists).
+    Full-text mode checks multiple official endpoints, keeps only the canonical
+    project sections, excludes TITLE from annotation, and falls back to the
+    PubMed abstract when selected PMC content is unavailable.
     """
 
     normalized_email = clean_text(ncbi_email)
@@ -3101,11 +3392,25 @@ def run_paper_retrieval(
         )
     normalized_tool = clean_text(ncbi_tool) or "ovarian_network_web"
 
+    if selection_mode not in {"default_augmented", "explicit_pmids_only"}:
+        raise ValueError(f"Unknown retrieval selection mode: {selection_mode}")
+    selected_text_mode = normalize_text_mode(text_mode)
+    abstract_only = selected_text_mode == "abstract"
+
     started_monotonic = time.monotonic()
     started_at = utc_now_iso()
-    effective = build_effective_inputs(input_type, user_input)
-    effective_query = build_augmented_pubmed_query(
-        effective.user_keywords, effective.user_exclusions
+    explicit_pmids_only = selection_mode == "explicit_pmids_only"
+    effective = (
+        build_explicit_pmid_inputs(input_type, user_input)
+        if explicit_pmids_only
+        else build_effective_inputs(input_type, user_input)
+    )
+    effective_query = (
+        ""
+        if explicit_pmids_only
+        else build_augmented_pubmed_query(
+            effective.user_keywords, effective.user_exclusions
+        )
     )
     excluded_pmids = {
         normalized
@@ -3130,12 +3435,21 @@ def run_paper_retrieval(
     job_dir = papers_root / "jobs" / job_id
     corpus_path = papers_root / "corpus.jsonl"
     summary_path = job_dir / "summary.json"
-    for directory in (papers_root, fulltext_dir, chunks_dir, job_dir):
+    directories = [papers_root, chunks_dir, job_dir]
+    if not abstract_only:
+        directories.append(fulltext_dir)
+    for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
 
     stats: dict[str, Any] = {
         "paper_count": 0,
         "abstract_count": 0,
+        "papers_without_abstract": 0,
+        "title_fallback_paper_count": 0,
+        "metadata_only_paper_count": 0,
+        "abstract_fallback_lookup_count": 0,
+        "abstracts_recovered_from_epmc": 0,
+        "abstract_fallback_errors": 0,
         "metadata_reused_cache": 0,
         "metadata_downloaded_new": 0,
         "metadata_missing": 0,
@@ -3164,14 +3478,31 @@ def run_paper_retrieval(
         "papers_in_download": 0,
         "search_total_hits": 0,
         "search_selected": 0,
-        "search_result_limit": max(1, min(int(keyword_limit), PUBMED_ESEARCH_API_CAP)),
+        "explicit_pmid_selected": (
+            len(effective.pmids) if explicit_pmids_only else 0
+        ),
+        "search_result_limit": (
+            0
+            if explicit_pmids_only
+            else max(1, min(int(keyword_limit), PUBMED_ESEARCH_API_CAP))
+        ),
         "search_all_matches": False,
+        "selection_mode": selection_mode,
+        "text_mode": selected_text_mode,
+        "abstract_only": abstract_only,
+        "defaults_included": not explicit_pmids_only,
         "metadata_retry_count": METADATA_HTTP_ATTEMPTS - 1,
         "metadata_request_timeout_seconds": metadata_timeout,
-        "fulltext_request_timeout_seconds": min(
-            metadata_timeout, FULLTEXT_REQUEST_TIMEOUT
+        "fulltext_request_timeout_seconds": (
+            0
+            if abstract_only
+            else min(metadata_timeout, FULLTEXT_REQUEST_TIMEOUT)
         ),
-        "fulltext_attempt_mode": "retry_transient_refresh_negative_cache",
+        "fulltext_attempt_mode": (
+            "disabled_abstract_only"
+            if abstract_only
+            else "retry_transient_refresh_negative_cache"
+        ),
         "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
         "fulltext_negative_cache_days": FULLTEXT_NEGATIVE_CACHE_DAYS,
         "fulltext_checked_once": 0,
@@ -3205,13 +3536,21 @@ def run_paper_retrieval(
     reporter.emit(
         "preparing",
         3,
-        "Preparing the shared corpus and your additions...",
+        (
+            "Preparing an isolated corpus from the entered PMIDs..."
+            if explicit_pmids_only
+            else "Preparing the shared corpus and your additions..."
+        ),
         stats,
         force=True,
     )
 
     metadata_session = build_retry_session(f"{normalized_tool} ({normalized_email})")
-    fulltext_session = build_fulltext_session(f"{normalized_tool} ({normalized_email})")
+    fulltext_session = (
+        None
+        if abstract_only
+        else build_fulltext_session(f"{normalized_tool} ({normalized_email})")
+    )
     ncbi_pacer = RequestPacer(0.11 if ncbi_api_key else 0.36)
     fulltext_pacer = RequestPacer(0.36)
     store = CorpusStore(corpus_path)
@@ -3266,6 +3605,21 @@ def run_paper_retrieval(
         stats["abstract_count"] = sum(
             1 for record in records if clean_text(record.get("abstract"))
         )
+        stats["papers_without_abstract"] = max(
+            0, len(records) - int(stats["abstract_count"])
+        )
+        stats["title_fallback_paper_count"] = sum(
+            1
+            for record in records
+            if not clean_text(record.get("abstract"))
+            and clean_text(record.get("title"))
+        )
+        stats["metadata_only_paper_count"] = sum(
+            1
+            for record in records
+            if not clean_text(record.get("abstract"))
+            and not clean_text(record.get("title"))
+        )
         stats["metadata_reused_cache"] = len(metadata_reused_ids & active_ids)
         stats["metadata_downloaded_new"] = len(metadata_downloaded_ids & active_ids)
 
@@ -3273,24 +3627,38 @@ def run_paper_retrieval(
         safe_keyword_limit = max(
             1, min(int(keyword_limit), PUBMED_ESEARCH_API_CAP)
         )
-        search_message = (
-            f"Searching up to {safe_keyword_limit} PubMed results for the augmented query..."
-            if effective.user_keywords or effective.user_exclusions
-            else f"Searching up to {safe_keyword_limit} PubMed results for the built-in query..."
-        )
-        reporter.emit("searching", 8, search_message, stats, force=True)
-        search_total, search_ids = search_pubmed_limited(
-            metadata_session,
-            ncbi_pacer,
-            query=effective_query,
-            limit=safe_keyword_limit,
-            email=normalized_email,
-            tool=normalized_tool,
-            api_key=ncbi_api_key,
-            timeout=metadata_timeout,
-        )
-        stats["search_total_hits"] = search_total
-        stats["search_selected"] = len(search_ids)
+        if explicit_pmids_only:
+            search_ids: tuple[str, ...] = ()
+            reporter.emit(
+                "selecting_pmids",
+                8,
+                (
+                    f"Using {len(effective.pmids)} entered PMID"
+                    f"{'s' if len(effective.pmids) != 1 else ''}; the built-in "
+                    "query and default papers are not included."
+                ),
+                stats,
+                force=True,
+            )
+        else:
+            search_message = (
+                f"Searching up to {safe_keyword_limit} PubMed results for the augmented query..."
+                if effective.user_keywords or effective.user_exclusions
+                else f"Searching up to {safe_keyword_limit} PubMed results for the built-in query..."
+            )
+            reporter.emit("searching", 8, search_message, stats, force=True)
+            search_total, search_ids = search_pubmed_limited(
+                metadata_session,
+                ncbi_pacer,
+                query=effective_query,
+                limit=safe_keyword_limit,
+                email=normalized_email,
+                tool=normalized_tool,
+                api_key=ncbi_api_key,
+                timeout=metadata_timeout,
+            )
+            stats["search_total_hits"] = search_total
+            stats["search_selected"] = len(search_ids)
 
         selected_pmids = unique_preserving_order(
             pmid
@@ -3368,6 +3736,60 @@ def run_paper_retrieval(
                     }
                 )
 
+        # PubMed records do not always contain an abstract. For explicitly
+        # supplied PMIDs, make one secondary Europe PMC metadata lookup before
+        # accepting that the abstract is unavailable. This never fabricates text.
+        fallback_candidate_pmids = (
+            selected_pmids
+            if explicit_pmids_only
+            else unique_preserving_order(effective.pmids)
+        )
+        missing_abstract_pmids = tuple(
+            pmid
+            for pmid in fallback_candidate_pmids
+            if (
+                (canonical_id := store.id_index.get(f"pmid:{pmid}"))
+                and (record := store.get(canonical_id)) is not None
+                and not clean_text(record.get("abstract"))
+            )
+        )
+        stats["abstract_fallback_lookup_count"] = len(missing_abstract_pmids)
+        recovered_abstract_pmids: set[str] = set()
+        if missing_abstract_pmids:
+            reporter.emit(
+                "metadata",
+                33,
+                (
+                    "Checking Europe PMC for missing abstracts for "
+                    f"{len(missing_abstract_pmids)} explicitly selected PMID"
+                    f"{'s' if len(missing_abstract_pmids) != 1 else ''}..."
+                ),
+                stats,
+                force=True,
+            )
+            requested_missing = set(missing_abstract_pmids)
+            try:
+                for records in fetch_epmc_records_for_pmids(
+                    metadata_session,
+                    pmids=missing_abstract_pmids,
+                    timeout=metadata_timeout,
+                ):
+                    for record in records:
+                        pmid = normalize_pmid(record.get("pmid"))
+                        if pmid not in requested_missing:
+                            continue
+                        canonical_id = include(record, metadata_downloaded=True)
+                        merged = store.get(canonical_id) if canonical_id else None
+                        if merged is not None and clean_text(merged.get("abstract")):
+                            recovered_abstract_pmids.add(pmid)
+                    refresh_counts()
+            except RetrievalError as exc:
+                stats["abstract_fallback_errors"] = int(
+                    stats.get("abstract_fallback_errors") or 0
+                ) + 1
+                logger.warning("Europe PMC abstract recovery failed: %s", exc)
+        stats["abstracts_recovered_from_epmc"] = len(recovered_abstract_pmids)
+
         unresolved_pmcids: list[str] = []
         for pmcid in selected_pmcids:
             cached_id = store.id_index.get(f"pmcid:{pmcid}")
@@ -3428,189 +3850,235 @@ def run_paper_retrieval(
         stats["new_paper_count"] = len(new_job_ids)
         stats["existing_paper_count"] = len(job_records) - len(new_job_ids)
 
-        fulltext_available_ids: set[str] = set()
-        missing_fulltext_records: list[dict[str, Any]] = []
-        for record in job_records:
-            canonical_id = clean_text(record.get("canonical_id"))
-            cached_path = _resolve_fulltext_path(record, papers_root)
-            if cached_path is not None:
-                record["fulltext_path"] = str(cached_path.relative_to(papers_root))
-                record["fulltext_bytes"] = int(cached_path.stat().st_size)
-                record["fulltext_checked"] = True
-                record["fulltext_status"] = "downloaded"
-                record["fulltext_retriever_version"] = FULLTEXT_RETRIEVER_VERSION
-                record.setdefault("fulltext_source", "local_cache")
-                record.setdefault("fulltext_checked_at", utc_now_iso())
-                fulltext_available_ids.add(canonical_id)
-                stats["fulltext_reused_cache"] += 1
-            elif record.get("pmcid"):
-                if should_attempt_fulltext(record):
-                    missing_fulltext_records.append(record)
-                else:
-                    stats["fulltext_already_checked"] += 1
-
-        pmcid_to_records: dict[str, list[dict[str, Any]]] = {}
-        pmid_to_pmcid: dict[str, str] = {}
-        for record in job_records:
-            pmid = normalize_pmid(record.get("pmid"))
-            pmcid = normalize_pmcid(record.get("pmcid"))
-            if pmid and pmcid:
-                pmid_to_pmcid[pmid] = pmcid
-        for record in missing_fulltext_records:
-            pmcid = normalize_pmcid(record.get("pmcid"))
-            if pmcid:
-                pmcid_to_records.setdefault(pmcid, []).append(record)
-
-        missing_pmcids = tuple(pmcid_to_records)
-        reporter.emit(
-            "fulltext",
-            40,
-            (
-                "Retrieving missing PMC full text with batch requests and "
-                f"per-paper fallbacks for {len(missing_pmcids)} papers..."
-            ),
-            stats,
-            force=True,
-        )
-
-        def report_fulltext_progress(
-            current_step: int,
-            total_steps: int,
-            result: FulltextProgress,
-        ) -> None:
-            stats["fulltexts_downloaded"] = result.downloaded_count
-            stats["fulltext_downloaded_new"] = result.downloaded_count
-            stats["fulltext_not_available_current_run"] = result.unavailable_count
-            stats["fulltext_not_available"] = result.unavailable_count
-            stats["fulltext_pending_retry"] = result.failed_count
-            stats["fulltext_errors"] = result.failed_count
-            stats["fulltext_failed"] = result.failed_count
-            stats["fulltext_service_error_batches"] = result.service_error_batches
-            stats["fulltext_batch_requests"] = result.pubtator_requests
-            stats["fulltext_pubtator_requests"] = result.pubtator_requests
-            stats["fulltext_ncbi_bioc_requests"] = result.ncbi_bioc_requests
-            stats["fulltext_epmc_requests"] = result.epmc_requests
-            stats["fulltext_total_requests"] = result.requests_made
+        if abstract_only:
+            repaired_chunk_ids: set[str] = set()
             reporter.emit(
-                "fulltext",
-                progress_for_fraction(40, 84, current_step, max(1, total_steps)),
-                f"Completed full-text retrieval step {current_step} of {total_steps}...",
+                "abstracts",
+                40,
+                (
+                    "Abstract-only mode selected. PMC full-text retrieval is "
+                    "disabled, including locally cached full text."
+                ),
                 stats,
+                force=True,
             )
-
-        if missing_pmcids:
-            fulltext_result = fetch_pubtator3_fulltext_batches(
-                fulltext_session,
-                fulltext_pacer,
-                pmcids=missing_pmcids,
-                pmid_to_pmcid=pmid_to_pmcid,
-                timeout=min(metadata_timeout, FULLTEXT_REQUEST_TIMEOUT),
-                batch_size=FULLTEXT_BATCH_SIZE,
-                on_progress=report_fulltext_progress,
+            stats.update(
+                {
+                    "fulltexts_downloaded": 0,
+                    "fulltext_available": 0,
+                    "fulltext_downloaded_new": 0,
+                    "fulltext_reused_cache": 0,
+                    "fulltext_not_available": 0,
+                    "fulltext_not_available_current_run": 0,
+                    "fulltext_pending_retry": 0,
+                    "fulltext_errors": 0,
+                    "fulltext_failed": 0,
+                    "fulltext_checked_once": 0,
+                    "fulltext_already_checked": 0,
+                    "fulltext_service_error_batches": 0,
+                    "fulltext_batch_requests": 0,
+                    "fulltext_pubtator_requests": 0,
+                    "fulltext_ncbi_bioc_requests": 0,
+                    "fulltext_epmc_requests": 0,
+                    "fulltext_total_requests": 0,
+                }
+            )
+            reporter.emit(
+                "abstracts",
+                84,
+                (
+                    f"Prepared metadata for {len(job_records)} papers without "
+                    "making any full-text request."
+                ),
+                stats,
+                force=True,
             )
         else:
-            fulltext_result = FulltextBatchResult({}, (), (), 0, 0)
+            if fulltext_session is None:
+                raise RuntimeError("Full-text mode did not initialize its HTTP session.")
+            fulltext_available_ids: set[str] = set()
+            missing_fulltext_records: list[dict[str, Any]] = []
+            for record in job_records:
+                canonical_id = clean_text(record.get("canonical_id"))
+                cached_path = _resolve_fulltext_path(record, papers_root)
+                if cached_path is not None:
+                    record["fulltext_path"] = str(cached_path.relative_to(papers_root))
+                    record["fulltext_bytes"] = int(cached_path.stat().st_size)
+                    record["fulltext_checked"] = True
+                    record["fulltext_status"] = "downloaded"
+                    record["fulltext_retriever_version"] = FULLTEXT_RETRIEVER_VERSION
+                    record.setdefault("fulltext_source", "local_cache")
+                    record.setdefault("fulltext_checked_at", utc_now_iso())
+                    fulltext_available_ids.add(canonical_id)
+                    stats["fulltext_reused_cache"] += 1
+                elif record.get("pmcid"):
+                    if should_attempt_fulltext(record):
+                        missing_fulltext_records.append(record)
+                    else:
+                        stats["fulltext_already_checked"] += 1
+
+            pmcid_to_records: dict[str, list[dict[str, Any]]] = {}
+            pmid_to_pmcid: dict[str, str] = {}
+            for record in job_records:
+                pmid = normalize_pmid(record.get("pmid"))
+                pmcid = normalize_pmcid(record.get("pmcid"))
+                if pmid and pmcid:
+                    pmid_to_pmcid[pmid] = pmcid
+            for record in missing_fulltext_records:
+                pmcid = normalize_pmcid(record.get("pmcid"))
+                if pmcid:
+                    pmcid_to_records.setdefault(pmcid, []).append(record)
+
+            missing_pmcids = tuple(pmcid_to_records)
             reporter.emit(
                 "fulltext",
-                84,
-                "All eligible PMC full text was already cached or recently checked.",
+                40,
+                (
+                    "Retrieving missing PMC full text with batch requests and "
+                    f"per-paper fallbacks for {len(missing_pmcids)} papers..."
+                ),
                 stats,
                 force=True,
             )
 
-        repaired_chunk_ids: set[str] = set()
-        downloaded_ids: set[str] = set()
-        checked_at = utc_now_iso()
-
-        for pmcid, content in fulltext_result.documents.items():
-            output_path = fulltext_dir / f"{pmcid}.bioc.json.gz"
-            compressed_bytes = atomic_write_gzip_bytes(output_path, content)
-            legacy_path = fulltext_dir / f"{pmcid}.bioc.json"
-            if legacy_path != output_path:
-                legacy_path.unlink(missing_ok=True)
-            relative_path = str(output_path.relative_to(papers_root))
-            source = fulltext_result.document_sources.get(pmcid, "unknown")
-            for record in pmcid_to_records.get(pmcid, []):
-                canonical_id = clean_text(record.get("canonical_id"))
-                record.update(
-                    {
-                        "fulltext_path": relative_path,
-                        "fulltext_bytes": compressed_bytes,
-                        "fulltext_uncompressed_bytes": len(content),
-                        "fulltext_checked": True,
-                        "fulltext_status": "downloaded",
-                        "fulltext_checked_at": checked_at,
-                        "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
-                        "fulltext_source": source,
-                    }
-                )
-                fulltext_available_ids.add(canonical_id)
-                downloaded_ids.add(canonical_id)
-                repaired_chunk_ids.add(canonical_id)
-
-        unavailable_pmcids = set(fulltext_result.unavailable_now)
-        failed_pmcids = set(fulltext_result.failed_now)
-        classified_pmcids = (
-            set(fulltext_result.documents) | unavailable_pmcids | failed_pmcids
-        )
-        # Unclassified IDs reflect an interrupted or malformed retrieval stage;
-        # keep them retryable rather than converting uncertainty into a permanent
-        # negative cache entry.
-        failed_pmcids.update(set(missing_pmcids) - classified_pmcids)
-
-        for pmcid in unavailable_pmcids:
-            for record in pmcid_to_records.get(pmcid, []):
-                for field_name in (
-                    "fulltext_path",
-                    "fulltext_bytes",
-                    "fulltext_uncompressed_bytes",
-                    "fulltext_source",
-                ):
-                    record.pop(field_name, None)
-                record.update(
-                    {
-                        "fulltext_checked": True,
-                        "fulltext_status": "not_available",
-                        "fulltext_checked_at": checked_at,
-                        "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
-                    }
+            def report_fulltext_progress(
+                current_step: int,
+                total_steps: int,
+                result: FulltextProgress,
+            ) -> None:
+                stats["fulltexts_downloaded"] = result.downloaded_count
+                stats["fulltext_downloaded_new"] = result.downloaded_count
+                stats["fulltext_not_available_current_run"] = result.unavailable_count
+                stats["fulltext_not_available"] = result.unavailable_count
+                stats["fulltext_pending_retry"] = result.failed_count
+                stats["fulltext_errors"] = result.failed_count
+                stats["fulltext_failed"] = result.failed_count
+                stats["fulltext_service_error_batches"] = result.service_error_batches
+                stats["fulltext_batch_requests"] = result.pubtator_requests
+                stats["fulltext_pubtator_requests"] = result.pubtator_requests
+                stats["fulltext_ncbi_bioc_requests"] = result.ncbi_bioc_requests
+                stats["fulltext_epmc_requests"] = result.epmc_requests
+                stats["fulltext_total_requests"] = result.requests_made
+                reporter.emit(
+                    "fulltext",
+                    progress_for_fraction(40, 84, current_step, max(1, total_steps)),
+                    f"Completed full-text retrieval step {current_step} of {total_steps}...",
+                    stats,
                 )
 
-        for pmcid in failed_pmcids:
-            for record in pmcid_to_records.get(pmcid, []):
-                for field_name in (
-                    "fulltext_path",
-                    "fulltext_bytes",
-                    "fulltext_uncompressed_bytes",
-                    "fulltext_source",
-                ):
-                    record.pop(field_name, None)
-                record.update(
-                    {
-                        "fulltext_checked": False,
-                        "fulltext_status": "pending_retry",
-                        "fulltext_checked_at": checked_at,
-                        "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
-                    }
+            if missing_pmcids:
+                fulltext_result = fetch_pubtator3_fulltext_batches(
+                    fulltext_session,
+                    fulltext_pacer,
+                    pmcids=missing_pmcids,
+                    pmid_to_pmcid=pmid_to_pmcid,
+                    timeout=min(metadata_timeout, FULLTEXT_REQUEST_TIMEOUT),
+                    batch_size=FULLTEXT_BATCH_SIZE,
+                    on_progress=report_fulltext_progress,
+                )
+            else:
+                fulltext_result = FulltextBatchResult({}, (), (), 0, 0)
+                reporter.emit(
+                    "fulltext",
+                    84,
+                    "All eligible PMC full text was already cached or recently checked.",
+                    stats,
+                    force=True,
                 )
 
-        stats["fulltexts_downloaded"] = len(downloaded_ids)
-        stats["fulltext_downloaded_new"] = len(downloaded_ids)
-        stats["fulltext_checked_once"] = len(missing_pmcids)
-        stats["fulltext_not_available_current_run"] = len(unavailable_pmcids)
-        stats["fulltext_not_available"] = len(unavailable_pmcids)
-        stats["fulltext_pending_retry"] = len(failed_pmcids)
-        stats["fulltext_errors"] = len(failed_pmcids)
-        stats["fulltext_failed"] = len(failed_pmcids)
-        stats["fulltext_service_error_batches"] = (
-            fulltext_result.service_error_batches
-        )
-        stats["fulltext_batch_requests"] = fulltext_result.pubtator_requests
-        stats["fulltext_pubtator_requests"] = fulltext_result.pubtator_requests
-        stats["fulltext_ncbi_bioc_requests"] = fulltext_result.ncbi_bioc_requests
-        stats["fulltext_epmc_requests"] = fulltext_result.epmc_requests
-        stats["fulltext_total_requests"] = fulltext_result.requests_made
-        stats["fulltext_available"] = len(fulltext_available_ids)
+            repaired_chunk_ids: set[str] = set()
+            downloaded_ids: set[str] = set()
+            checked_at = utc_now_iso()
+
+            for pmcid, content in fulltext_result.documents.items():
+                output_path = fulltext_dir / f"{pmcid}.bioc.json.gz"
+                compressed_bytes = atomic_write_gzip_bytes(output_path, content)
+                legacy_path = fulltext_dir / f"{pmcid}.bioc.json"
+                if legacy_path != output_path:
+                    legacy_path.unlink(missing_ok=True)
+                relative_path = str(output_path.relative_to(papers_root))
+                source = fulltext_result.document_sources.get(pmcid, "unknown")
+                for record in pmcid_to_records.get(pmcid, []):
+                    canonical_id = clean_text(record.get("canonical_id"))
+                    record.update(
+                        {
+                            "fulltext_path": relative_path,
+                            "fulltext_bytes": compressed_bytes,
+                            "fulltext_uncompressed_bytes": len(content),
+                            "fulltext_checked": True,
+                            "fulltext_status": "downloaded",
+                            "fulltext_checked_at": checked_at,
+                            "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
+                            "fulltext_source": source,
+                        }
+                    )
+                    fulltext_available_ids.add(canonical_id)
+                    downloaded_ids.add(canonical_id)
+                    repaired_chunk_ids.add(canonical_id)
+
+            unavailable_pmcids = set(fulltext_result.unavailable_now)
+            failed_pmcids = set(fulltext_result.failed_now)
+            classified_pmcids = (
+                set(fulltext_result.documents) | unavailable_pmcids | failed_pmcids
+            )
+            # Unclassified IDs reflect an interrupted or malformed retrieval stage;
+            # keep them retryable rather than converting uncertainty into a permanent
+            # negative cache entry.
+            failed_pmcids.update(set(missing_pmcids) - classified_pmcids)
+
+            for pmcid in unavailable_pmcids:
+                for record in pmcid_to_records.get(pmcid, []):
+                    for field_name in (
+                        "fulltext_path",
+                        "fulltext_bytes",
+                        "fulltext_uncompressed_bytes",
+                        "fulltext_source",
+                    ):
+                        record.pop(field_name, None)
+                    record.update(
+                        {
+                            "fulltext_checked": True,
+                            "fulltext_status": "not_available",
+                            "fulltext_checked_at": checked_at,
+                            "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
+                        }
+                    )
+
+            for pmcid in failed_pmcids:
+                for record in pmcid_to_records.get(pmcid, []):
+                    for field_name in (
+                        "fulltext_path",
+                        "fulltext_bytes",
+                        "fulltext_uncompressed_bytes",
+                        "fulltext_source",
+                    ):
+                        record.pop(field_name, None)
+                    record.update(
+                        {
+                            "fulltext_checked": False,
+                            "fulltext_status": "pending_retry",
+                            "fulltext_checked_at": checked_at,
+                            "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
+                        }
+                    )
+
+            stats["fulltexts_downloaded"] = len(downloaded_ids)
+            stats["fulltext_downloaded_new"] = len(downloaded_ids)
+            stats["fulltext_checked_once"] = len(missing_pmcids)
+            stats["fulltext_not_available_current_run"] = len(unavailable_pmcids)
+            stats["fulltext_not_available"] = len(unavailable_pmcids)
+            stats["fulltext_pending_retry"] = len(failed_pmcids)
+            stats["fulltext_errors"] = len(failed_pmcids)
+            stats["fulltext_failed"] = len(failed_pmcids)
+            stats["fulltext_service_error_batches"] = (
+                fulltext_result.service_error_batches
+            )
+            stats["fulltext_batch_requests"] = fulltext_result.pubtator_requests
+            stats["fulltext_pubtator_requests"] = fulltext_result.pubtator_requests
+            stats["fulltext_ncbi_bioc_requests"] = fulltext_result.ncbi_bioc_requests
+            stats["fulltext_epmc_requests"] = fulltext_result.epmc_requests
+            stats["fulltext_total_requests"] = fulltext_result.requests_made
+            stats["fulltext_available"] = len(fulltext_available_ids)
 
         # job_records already contains references to the shared corpus records;
         # no second upsert/reindex pass is needed here.
@@ -3630,8 +4098,12 @@ def run_paper_retrieval(
             "chunks",
             86,
             (
-                "Reusing cached chunks and rebuilding only papers whose missing "
-                "full text was downloaded..."
+                "Building abstract-only chunks; full-text files are ignored..."
+                if abstract_only
+                else (
+                    "Reusing cached chunks and rebuilding only papers whose "
+                    "missing full text was downloaded..."
+                )
             ),
             stats,
             force=True,
@@ -3647,11 +4119,19 @@ def run_paper_retrieval(
                 "chunks",
                 progress_for_fraction(86, 98, current, max(1, total)),
                 (
-                    f"Prepared {current} of {total} papers: "
-                    f"{chunk_stats['chunk_papers_reused']} reused, "
-                    f"{chunk_stats['chunk_papers_generated_new']} new, and "
-                    f"{chunk_stats['chunk_papers_rebuilt_fulltext']} rebuilt from "
-                    "newly available full text."
+                    (
+                        f"Prepared {current} of {total} papers as abstract-only "
+                        f"chunks: {chunk_stats['chunk_papers_reused']} reused and "
+                        f"{chunk_stats['chunk_papers_generated_new']} generated."
+                    )
+                    if abstract_only
+                    else (
+                        f"Prepared {current} of {total} papers: "
+                        f"{chunk_stats['chunk_papers_reused']} reused, "
+                        f"{chunk_stats['chunk_papers_generated_new']} new, and "
+                        f"{chunk_stats['chunk_papers_rebuilt_fulltext']} rebuilt "
+                        "from newly available full text."
+                    )
                 ),
                 stats,
             )
@@ -3664,14 +4144,35 @@ def run_paper_retrieval(
                 cache_index=chunk_cache,
                 new_canonical_ids=new_job_ids,
                 rebuild_canonical_ids=repaired_chunk_ids,
+                text_mode=selected_text_mode,
                 on_progress=report_chunk_progress,
             )
         stats.update(chunk_stats)
+        if len(chunk_paths) != len(job_records):
+            raise RetrievalError(
+                "The selected PMID set did not produce exactly one per-paper "
+                "chunk artifact. Refusing to publish an incomplete download."
+            )
         stats["chunk_part_count"] = len(chunk_paths)
         stats["papers_in_download"] = len(chunk_paths)
         stats["paper_count"] = len(job_records)
         stats["abstract_count"] = sum(
             1 for record in job_records if clean_text(record.get("abstract"))
+        )
+        stats["papers_without_abstract"] = max(
+            0, len(job_records) - int(stats["abstract_count"])
+        )
+        stats["title_fallback_paper_count"] = sum(
+            1
+            for record in job_records
+            if not clean_text(record.get("abstract"))
+            and clean_text(record.get("title"))
+        )
+        stats["metadata_only_paper_count"] = sum(
+            1
+            for record in job_records
+            if not clean_text(record.get("abstract"))
+            and not clean_text(record.get("title"))
         )
         stats["elapsed_seconds"] = round(time.monotonic() - started_monotonic, 2)
         store.save()
@@ -3685,13 +4186,24 @@ def run_paper_retrieval(
                 "type": input_type,
                 "parsing_mode": USER_INPUT_MODE,
                 "input_parser_version": INPUT_PARSER_VERSION,
+                "selection_mode": selection_mode,
+                "text_mode": selected_text_mode,
+                "chunk_output_version": CHUNK_OUTPUT_VERSION,
+                "abstract_only": abstract_only,
                 "user_value": effective.raw_user_input,
                 "user_keywords": list(effective.user_keywords),
                 "user_exclusions": list(effective.user_exclusions),
-                "defaults_included": True,
-                "default_query_label": DEFAULT_QUERY_LABEL,
-                "default_pmid_count": len(DEFAULT_PMIDS),
-                "default_pmcid_count": len(DEFAULT_PMCIDS),
+                "requested_pmids": list(effective.pmids),
+                "defaults_included": not explicit_pmids_only,
+                "default_query_label": (
+                    None if explicit_pmids_only else DEFAULT_QUERY_LABEL
+                ),
+                "default_pmid_count": (
+                    0 if explicit_pmids_only else len(DEFAULT_PMIDS)
+                ),
+                "default_pmcid_count": (
+                    0 if explicit_pmids_only else len(DEFAULT_PMCIDS)
+                ),
                 "user_keyword_count": effective.user_keyword_count,
                 "user_exclusion_count": effective.user_exclusion_count,
                 "user_pmid_count": effective.user_pmid_count,
@@ -3703,20 +4215,40 @@ def run_paper_retrieval(
                 "user_keyword_added": bool(effective.user_keywords),
                 "user_exclusion_added": bool(effective.user_exclusions),
                 "user_keyword_ignored_as_duplicate": effective.user_keyword_was_redundant,
-                "keyword_search_mode": "single_augmented_query_with_exclusions",
-                "keyword_limit": max(
-                    1, min(int(keyword_limit), PUBMED_ESEARCH_API_CAP)
+                "keyword_search_mode": (
+                    "skipped_for_explicit_pmids"
+                    if explicit_pmids_only
+                    else "single_augmented_query_with_exclusions"
                 ),
-                "pubmed_result_mode": "limited_relevance_results",
+                "keyword_limit": (
+                    0
+                    if explicit_pmids_only
+                    else max(1, min(int(keyword_limit), PUBMED_ESEARCH_API_CAP))
+                ),
+                "pubmed_result_mode": (
+                    "explicit_pmids_only"
+                    if explicit_pmids_only
+                    else "limited_relevance_results"
+                ),
                 "metadata_retry_count": METADATA_HTTP_ATTEMPTS - 1,
                 "metadata_request_timeout_seconds": metadata_timeout,
-                "fulltext_request_timeout_seconds": min(
-                    metadata_timeout, FULLTEXT_REQUEST_TIMEOUT
+                "fulltext_request_timeout_seconds": (
+                    0
+                    if abstract_only
+                    else min(metadata_timeout, FULLTEXT_REQUEST_TIMEOUT)
                 ),
-                "fulltext_attempt_mode": "retry_transient_refresh_negative_cache",
+                "fulltext_attempt_mode": (
+                    "disabled_abstract_only"
+                    if abstract_only
+                    else "retry_transient_refresh_negative_cache"
+                ),
                 "fulltext_retriever_version": FULLTEXT_RETRIEVER_VERSION,
                 "fulltext_negative_cache_days": FULLTEXT_NEGATIVE_CACHE_DAYS,
-                "fulltext_storage": "compact_bioc_json_gzip",
+                "fulltext_storage": (
+                    "not_used_abstract_only"
+                    if abstract_only
+                    else "compact_bioc_json_gzip"
+                ),
                 "baseline_filter_enabled": bool(
                     excluded_pmids or excluded_pmcids or excluded_canonical_ids
                 ),
@@ -3724,6 +4256,8 @@ def run_paper_retrieval(
             "stats": stats,
             "files": {
                 "storage_mode": "shared_per_paper",
+                "text_mode": selected_text_mode,
+                "chunk_output_version": CHUNK_OUTPUT_VERSION,
                 "chunk_cache_compression": "gzip",
                 "download_compression": "none",
                 "download_name": "chunks.jsonl",
@@ -3734,16 +4268,40 @@ def run_paper_retrieval(
         }
         write_json(summary_path, summary)
 
-        completion_message = (
-            f"Finished: {stats['paper_count']} papers; "
-            f"{stats['fulltexts_downloaded']} full texts downloaded; "
-            f"{stats['papers_without_pmcid']} papers without a PMCID."
+        fallback_message = (
+            f" {stats['title_fallback_paper_count']} paper(s) use title-only "
+            "fallback;"
+            if stats["title_fallback_paper_count"]
+            else ""
         )
-        if stats["fulltext_failed"]:
-            completion_message += (
-                f" {stats['fulltext_failed']} full-text checks encountered a "
-                "temporary error and remain eligible for retry."
+        if stats["metadata_only_paper_count"]:
+            fallback_message += (
+                f" {stats['metadata_only_paper_count']} paper(s) contain metadata "
+                "only because no abstract or title was available;"
             )
+        if fallback_message:
+            fallback_message = fallback_message.rstrip(";") + "."
+
+        if abstract_only:
+            completion_message = (
+                f"Finished: {stats['paper_count']} papers retained; "
+                f"{stats['abstract_count']} abstracts available; "
+                "no full text was requested or processed."
+                f"{fallback_message}"
+            )
+        else:
+            completion_message = (
+                f"Finished: {stats['paper_count']} papers retained; "
+                f"{stats['abstract_count']} abstracts available; "
+                f"{stats['fulltexts_downloaded']} full texts downloaded; "
+                f"{stats['papers_without_pmcid']} papers without a PMCID."
+                f"{fallback_message}"
+            )
+            if stats["fulltext_failed"]:
+                completion_message += (
+                    f" {stats['fulltext_failed']} full-text checks encountered a "
+                    "temporary error and remain eligible for retry."
+                )
         reporter.emit(
             "completed",
             100,
@@ -3761,4 +4319,5 @@ def run_paper_retrieval(
         )
     finally:
         metadata_session.close()
-        fulltext_session.close()
+        if fulltext_session is not None:
+            fulltext_session.close()

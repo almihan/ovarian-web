@@ -102,19 +102,11 @@ function formatType(value) {
     return type === "gene" ? "Gene / protein" : type === "cell" ? "Cell / cell type" : type === "hormone" ? "Hormone" : "Entity";
 }
 
-function isUndirectedPredicate(predicate) {
-    return String(predicate || "").toLowerCase() === "binding";
-}
-
 function relationEndpointText(subject, predicate, object) {
-    const separator = isUndirectedPredicate(predicate) ? " — " : " → ";
-    return `${subject || ""}${separator}${object || ""}`;
+    return `${subject || ""} → ${object || ""}`;
 }
 
 function relationEvidenceText(subject, predicate, object) {
-    if (isUndirectedPredicate(predicate)) {
-        return `${subject || ""} — ${predicate || "binding"} — ${object || ""}`;
-    }
     return `${subject || ""} — ${predicate || "relation"} → ${object || ""}`;
 }
 
@@ -160,9 +152,22 @@ function setBuildProgress(job) {
     $("#networkStatusText").textContent = job?.message || "Preparing network explorer…";
 }
 
+function visibleInteractionEdges() {
+    if (!state.edges) return [];
+    return state.edges.get().filter((edge) => (
+        edge?.edge_kind !== "hierarchy"
+        && String(edge?.id || "").trim()
+        && String(edge?.from || "").trim()
+        && String(edge?.to || "").trim()
+        && String(edge?.predicate || edge?.label || "").trim()
+    ));
+}
+
 function setVisibleCounts() {
     $("#viewNodeCount").textContent = formatNumber(state.nodes?.length || 0);
     $("#viewEdgeCount").textContent = formatNumber(state.edges?.length || 0);
+    const saveButton = $("#saveDisplayedNetwork");
+    if (saveButton) saveButton.disabled = visibleInteractionEdges().length === 0;
 }
 
 function removeNetworkTooltips(items) {
@@ -183,9 +188,7 @@ function nodeColorForType(entityType) {
 
 function edgeColorForPredicate(predicate) {
     const value = String(predicate || "").toLowerCase();
-    if (["inhibition", "downregulation"].includes(value)) return "#C64B4B";
-    if (value === "binding") return "#4F72B8";
-    if (value === "biosynthesis") return "#7A63B8";
+    if (value === "inhibition") return "#C64B4B";
     if (value === "secreted") return "#2D8C87";
     return "#2F8B68";
 }
@@ -211,10 +214,22 @@ function normalizeNetworkNodes(nodes) {
 function normalizeNetworkEdges(edges) {
     return removeNetworkTooltips(edges).map((edge) => {
         if (edge.edge_kind === "hierarchy") return edge;
-        const color = edgeColorForPredicate(edge.predicate || edge.label);
+        const serverColor = edge?.color && typeof edge.color === "object" ? edge.color : {};
+        const color = serverColor.color || edgeColorForPredicate(edge.predicate || edge.label);
+        const rawOpacity = Number(serverColor.opacity);
+        const opacity = Number.isFinite(rawOpacity)
+            ? Math.max(0.08, Math.min(1, rawOpacity))
+            : 0.86;
         return {
             ...edge,
-            color: { color, highlight: color, hover: color, opacity: 0.86 },
+            width: 2,
+            color: {
+                ...serverColor,
+                color,
+                highlight: serverColor.highlight || color,
+                hover: serverColor.hover || color,
+                opacity,
+            },
         };
     });
 }
@@ -230,14 +245,32 @@ function detailRows(rows) {
 
 function renderNodeDetail(node) {
     const aliases = Array.isArray(node.aliases) ? node.aliases : [];
+    const identifierRows = [
+        ["Canonical identity", node.normalized_id],
+        ["NCBI Gene ID", node.ncbi_gene_id],
+        ["HGNC supporting ID", node.hgnc_id],
+        ["MeSH ID", node.mesh_id],
+        ["UniProt", node.uniprot_ids],
+        ["PubTator3 source ID", node.source_concept_id],
+    ].filter(([, value]) => String(value || "").trim());
+    const normalizationRows = [
+        ["Canonical name", node.canonical_name],
+        ["Canonical namespace", String(node.canonical_id_type || "").toUpperCase()],
+        ["Normalization source", node.normalization_source],
+        ["Match method", node.normalization_match_method],
+        ["Status", String(node.normalization_status || "").replaceAll("_", " ")],
+    ].filter(([, value]) => String(value || "").trim());
     $("#detailsHeading").textContent = node.label || node.id;
-    $("#detailsSubheading").textContent = `${formatType(node.entity_type)} · normalized across the complete Stage 3 artifact`;
+    $("#detailsSubheading").textContent = `${formatType(node.entity_type)} · canonically normalized for the Stage 4 network`;
     $("#detailsContent").innerHTML = `
         <div class="detail-card">
             ${typePill(node.entity_type)}
+            ${detailRows(identifierRows)}
+        </div>
+        ${normalizationRows.length ? `<div class="detail-card"><h3>Normalization</h3>${detailRows(normalizationRows)}</div>` : ""}
+        <div class="detail-card">
+            <h3>Network evidence</h3>
             ${detailRows([
-                ["Normalized identity", node.normalized_id],
-                ["Standard name", node.label || node.id],
                 ["Papers", formatNumber(node.paper_count)],
                 ["Chunks", formatNumber(node.chunk_count)],
                 ["Relations", formatNumber(node.relation_count)],
@@ -250,9 +283,6 @@ function renderNodeDetail(node) {
 }
 
 function renderEdgeDetail(edge) {
-    const undirected = edge.directed === false || isUndirectedPredicate(edge.predicate);
-    const firstEndpointLabel = undirected ? "Endpoint 1" : "Subject";
-    const secondEndpointLabel = undirected ? "Endpoint 2" : "Object";
     $("#detailsHeading").textContent = edge.predicate || "Relation";
     $("#detailsSubheading").textContent = relationEndpointText(
         edge.subject_label || edge.subject_id,
@@ -261,11 +291,11 @@ function renderEdgeDetail(edge) {
     );
     $("#detailsContent").innerHTML = `
         <div class="detail-card">
-            ${typePill("edge", undirected ? "Undirected relation" : "Directed relation")}
+            ${typePill("edge", "Directed relation")}
             ${detailRows([
-                [firstEndpointLabel, `${edge.subject_label || edge.subject_id} (${formatType(edge.subject_type)})`],
+                ["Subject", `${edge.subject_label || edge.subject_id} (${formatType(edge.subject_type)})`],
                 ["Predicate", edge.predicate],
-                [secondEndpointLabel, `${edge.object_label || edge.object_id} (${formatType(edge.object_type)})`],
+                ["Object", `${edge.object_label || edge.object_id} (${formatType(edge.object_type)})`],
                 ["Papers", formatNumber(edge.paper_count)],
                 ["Chunks / evidence", formatNumber(edge.evidence_count)],
             ])}
@@ -586,6 +616,84 @@ function buildNetwork(payload, { replace = true } = {}) {
     $("#networkStatusText").textContent = `${formatNumber(state.nodes.length)} nodes and ${formatNumber(state.edges.length)} edges are visible.`;
 }
 
+function responseDownloadFilename(response, fallback) {
+    const disposition = String(response.headers.get("content-disposition") || "");
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match?.[1]) {
+        try {
+            return decodeURIComponent(utf8Match[1]);
+        } catch {
+            return utf8Match[1];
+        }
+    }
+    const plainMatch = disposition.match(/filename="?([^";]+)"?/i);
+    return plainMatch?.[1] || fallback;
+}
+
+async function saveDisplayedNetwork() {
+    const edgeIds = visibleInteractionEdges()
+        .map((edge) => String(edge?.id || "").trim())
+        .filter(Boolean);
+    if (!edgeIds.length) {
+        showToast("There are no displayed interaction relations to save.");
+        return;
+    }
+
+    const button = $("#saveDisplayedNetwork");
+    const previousText = button?.textContent || "Save displayed network";
+    if (button) {
+        button.disabled = true;
+        button.textContent = "Preparing…";
+    }
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 120000);
+    try {
+        const response = await fetch(
+            `/api/networks/${encodeURIComponent(jobId)}/export/displayed-network`,
+            {
+                method: "POST",
+                headers: {
+                    Accept: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ edge_ids: edgeIds }),
+                cache: "no-store",
+                signal: controller.signal,
+            },
+        );
+        if (!response.ok) {
+            let message = `The spreadsheet export failed with status ${response.status}.`;
+            try {
+                const payload = await response.json();
+                message = payload?.detail || message;
+            } catch {
+                // Keep the status-based fallback.
+            }
+            throw new Error(message);
+        }
+        const blob = await response.blob();
+        const filename = responseDownloadFilename(response, "displayed-network.xlsx");
+        const objectUrl = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = objectUrl;
+        link.download = filename;
+        link.hidden = true;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        showToast(`Saved ${formatNumber(edgeIds.length)} displayed relation${edgeIds.length === 1 ? "" : "s"} in a plain Excel worksheet.`);
+    } catch (error) {
+        showToast(error?.name === "AbortError" ? "The spreadsheet export timed out." : error.message);
+    } finally {
+        window.clearTimeout(timeout);
+        if (button) {
+            button.textContent = previousText;
+            button.disabled = visibleInteractionEdges().length === 0;
+        }
+    }
+}
+
 function relationDisplayName(predicate) {
     return String(predicate || "relation")
         .replaceAll("_", " ")
@@ -728,6 +836,38 @@ async function loadFullGraph() {
         window.setTimeout(() => state.network?.fit({ animation: { duration: 450, easingFunction: "easeInOutQuad" } }), 150);
     } catch (error) {
         showToast(error.message);
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
+async function loadClosedGraph() {
+    const supportMin = currentRelationSupportMin();
+    const button = $("#showClosedGraph");
+    if (button) button.disabled = true;
+    $("#networkStatusText").textContent = `Loading closed interaction loops with relation support ≥ ${formatNumber(supportMin)} paper(s)…`;
+    try {
+        const payload = await requestJson(
+            `/api/networks/${encodeURIComponent(jobId)}/graph/closed?relation_support_min=${encodeURIComponent(supportMin)}`,
+            { timeoutMs: 120000 },
+        );
+        buildNetwork(payload, { replace: true });
+        state.viewMode = "closed_loops";
+        setRelationTypeSelection([]);
+        const componentCount = Number(payload?.component_count || 0);
+        const removedOpenEdges = Number(payload?.removed_open_edge_count || 0);
+        if (componentCount > 0) {
+            $("#networkStatusText").textContent = `${formatNumber(componentCount)} closed-loop network${componentCount === 1 ? "" : "s"}, ${formatNumber(state.nodes.length)} cycle-supported nodes, and ${formatNumber(state.edges.length)} cycle-supported relations are visible. ${formatNumber(removedOpenEdges)} dangling or bridge relation${removedOpenEdges === 1 ? " was" : "s were"} removed.`;
+            showToast(`Showing every closed-loop component. ${formatNumber(removedOpenEdges)} dangling or bridge link${removedOpenEdges === 1 ? " was" : "s were"} removed.`);
+        } else {
+            $("#networkStatusText").textContent = `No closed-loop network met the relation support threshold. ${formatNumber(removedOpenEdges)} dangling or bridge relation${removedOpenEdges === 1 ? " was" : "s were"} omitted.`;
+            showToast("No closed-loop network is available at the current relation-support threshold.");
+        }
+        window.setTimeout(() => state.network?.fit({ animation: { duration: 550, easingFunction: "easeInOutQuad" } }), 180);
+        return payload;
+    } catch (error) {
+        showToast(error.message);
+        return null;
     } finally {
         if (button) button.disabled = false;
     }
@@ -959,9 +1099,12 @@ async function pollJobUntilReady() {
 
 function bindControls() {
     $("#returnHome")?.addEventListener("click", (event) => {
-        if (window.history.length <= 1) return;
-        event.preventDefault();
-        window.history.back();
+        if (window.history.length > 1) {
+            event.preventDefault();
+            window.history.back();
+            return;
+        }
+        event.currentTarget.href = "/?resume=1#pipeline";
     });
     $$(".tab-button").forEach((button) => button.addEventListener("click", () => {
         const tab = button.dataset.tab;
@@ -969,6 +1112,7 @@ function bindControls() {
         if (tab === "hierarchy") void showCellHierarchy({ activate: false });
     }));
     $("#fitNetwork")?.addEventListener("click", () => state.network?.fit({ animation: { duration: 450, easingFunction: "easeInOutQuad" } }));
+    $("#saveDisplayedNetwork")?.addEventListener("click", () => void saveDisplayedNetwork());
     $("#resetNetwork")?.addEventListener("click", async () => {
         try {
             await loadRelationTypes({ preserveSelection: false });
@@ -983,6 +1127,14 @@ function bindControls() {
             await loadRelationTypes({ preserveSelection: false });
             await loadFullGraph();
             showToast("The full graph was restored.");
+        } catch (error) {
+            showToast(error.message);
+        }
+    });
+    $("#showClosedGraph")?.addEventListener("click", async () => {
+        try {
+            await loadRelationTypes({ preserveSelection: false });
+            await loadClosedGraph();
         } catch (error) {
             showToast(error.message);
         }

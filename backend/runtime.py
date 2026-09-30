@@ -1,8 +1,9 @@
-"""Ephemeral per-page pipeline state.
+"""Temporary in-process pipeline state.
 
-A run exists only in this FastAPI process and is addressed by a random ID kept
-in the current page's JavaScript memory. Nothing here is written to SQLite,
-cookies, browser storage, or a user-history table.
+A run exists only in this FastAPI process. The landing page may keep its random
+run ID in browser session storage so Back/Home navigation can restore the same
+state; refreshing the landing page intentionally clears that browser reference.
+No persistent user-job history is created.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ def _new_stage(name: str, *, first: bool = False) -> dict[str, Any]:
         "stage": "ready" if first else "locked",
         "progress": 0,
         "message": (
-            "Ready to retrieve the shared default corpus and this run's additions."
+            "Ready to retrieve the selected papers for this run."
             if first
             else "Complete the preceding stage to continue."
         ),
@@ -61,13 +62,26 @@ class RunRegistry:
         with self._lock:
             self._runs.clear()
 
-    def create(self, *, query: str, has_custom_input: bool) -> dict[str, Any]:
+    def create(
+        self,
+        *,
+        query: str,
+        has_custom_input: bool,
+        input_mode: str = "precomputed",
+        text_mode: str = "fulltext",
+        corpus_id: str = "",
+        corpus_label: str = "",
+    ) -> dict[str, Any]:
         run_id = secrets.token_hex(16)
         now = utc_now()
         record = {
             "id": run_id,
             "query": query,
             "has_custom_input": bool(has_custom_input),
+            "input_mode": str(input_mode or "precomputed"),
+            "text_mode": str(text_mode or "fulltext"),
+            "corpus_id": str(corpus_id or ""),
+            "corpus_label": str(corpus_label or ""),
             "created_at": now,
             "updated_at": now,
             "stages": {
@@ -237,6 +251,8 @@ class RunRegistry:
         removed: list[dict[str, Any]] = []
         with self._lock:
             for run_id, record in tuple(self._runs.items()):
+                if (record.get("private") or {}).get("retain_for_update"):
+                    continue
                 stages = record.get("stages") or {}
                 if any(
                     (stages.get(name) or {}).get("status") in _ACTIVE_STATUSES

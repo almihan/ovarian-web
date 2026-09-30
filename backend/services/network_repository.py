@@ -41,12 +41,11 @@ _NODE_COLORS = {
         "hover": {"background": "#AA7FDD", "border": "#AA7FDD"},
     },
 }
-_NEGATIVE = {"inhibition", "downregulation"}
+_NEGATIVE = {"inhibition"}
 _EDGE_COLORS = {
-    "binding": "#4F72B8",
-    "biosynthesis": "#7A63B8",
     "secreted": "#2D8C87",
 }
+_INTERACTION_EDGE_WIDTH = 2.0
 _ONE_MIB = 1024 * 1024
 _HIERARCHY_NODE_COLOR = {
     "background": "#E8F7F2",
@@ -139,7 +138,7 @@ def _node_title(node: Mapping[str, Any]) -> str:
 
 def _edge_title(edge: Mapping[str, Any]) -> str:
     predicate = str(edge.get("predicate") or "relation")
-    separator = " — " if predicate == "binding" else " → "
+    separator = " → "
     return (
         f"<strong>{html.escape(predicate)}</strong><br>"
         f"{html.escape(str(edge.get('subject_label') or edge.get('subject_id') or ''))}"
@@ -155,6 +154,74 @@ def _edge_color(predicate: str) -> str:
     if predicate in _NEGATIVE:
         return "#C64B4B"
     return _EDGE_COLORS.get(predicate, "#2F8B68")
+
+
+def _undirected_pair(left: Any, right: Any) -> tuple[str, str]:
+    """Return a deterministic unordered endpoint pair for topology checks."""
+
+    first = str(left)
+    second = str(right)
+    return (first, second) if first <= second else (second, first)
+
+
+def _bridge_pairs(edges: Sequence[Mapping[str, Any]]) -> set[tuple[str, str]]:
+    """Find undirected bridge pairs without changing relation direction.
+
+    Arrow direction is ignored only for detecting closed topology. Endpoint
+    pairs are treated as one structural link even when several predicates connect
+    the same nodes. Every retained structural link therefore belongs to a cycle.
+    """
+
+    adjacency: dict[str, set[str]] = {}
+    for edge in edges:
+        left = str(edge.get("subject_id") or "")
+        right = str(edge.get("object_id") or "")
+        if not left or not right or left == right:
+            continue
+        adjacency.setdefault(left, set()).add(right)
+        adjacency.setdefault(right, set()).add(left)
+
+    discovered: dict[str, int] = {}
+    low: dict[str, int] = {}
+    parent: dict[str, str | None] = {}
+    bridges: set[tuple[str, str]] = set()
+    clock = 0
+
+    for root in sorted(adjacency):
+        if root in discovered:
+            continue
+        clock += 1
+        discovered[root] = clock
+        low[root] = clock
+        parent[root] = None
+        stack: list[tuple[str, Any]] = [(root, iter(sorted(adjacency[root])))]
+
+        while stack:
+            node_id, neighbours = stack[-1]
+            try:
+                neighbour = next(neighbours)
+            except StopIteration:
+                stack.pop()
+                parent_id = parent.get(node_id)
+                if parent_id is not None:
+                    low[parent_id] = min(low[parent_id], low[node_id])
+                    pair = _undirected_pair(parent_id, node_id)
+                    if low[node_id] > discovered[parent_id]:
+                        bridges.add(pair)
+                continue
+
+            if neighbour == parent.get(node_id):
+                continue
+            if neighbour not in discovered:
+                parent[neighbour] = node_id
+                clock += 1
+                discovered[neighbour] = clock
+                low[neighbour] = clock
+                stack.append((neighbour, iter(sorted(adjacency[neighbour]))))
+                continue
+            low[node_id] = min(low[node_id], discovered[neighbour])
+
+    return bridges
 
 
 def _node_payload(
@@ -178,6 +245,20 @@ def _node_payload(
         "ontology_only": False,
         "entity_type": entity_type,
         "normalized_id": str(node.get("normalized_id") or ""),
+        "canonical_name": str(node.get("canonical_name") or ""),
+        "canonical_id_type": str(node.get("canonical_id_type") or ""),
+        "hgnc_id": str(node.get("hgnc_id") or ""),
+        "ncbi_gene_id": str(node.get("ncbi_gene_id") or ""),
+        "chebi_id": str(node.get("chebi_id") or ""),
+        "mesh_id": str(node.get("mesh_id") or ""),
+        "uniprot_ids": str(node.get("uniprot_ids") or ""),
+        "source_concept_id": str(node.get("source_concept_id") or ""),
+        "normalization_source": str(node.get("normalization_source") or ""),
+        "normalization_status": str(node.get("normalization_status") or ""),
+        "normalization_match_method": str(
+            node.get("normalization_match_method") or ""
+        ),
+        "chebi_release": str(node.get("chebi_release") or ""),
         "cl_id": normalize_cl_id(node.get("normalized_id")),
         "paper_count": paper_count,
         "chunk_count": int(node.get("chunk_count") or 0),
@@ -206,12 +287,29 @@ def _node_payload(
     }
 
 
-def _edge_payload(edge: Mapping[str, Any], node_sizes: Mapping[str, float]) -> dict[str, Any]:
+def _edge_payload(
+    edge: Mapping[str, Any],
+    node_sizes: Mapping[str, float],
+    *,
+    min_paper_count: int,
+    max_paper_count: int,
+) -> dict[str, Any]:
     evidence_count = int(edge.get("evidence_count") or 0)
     paper_count = int(edge.get("paper_count") or 0)
     predicate = str(edge.get("predicate") or "relation")
-    directed = predicate != "binding"
+    directed = True
     color = _edge_color(predicate)
+    if max_paper_count <= min_paper_count:
+        support_fraction = 0.72 if paper_count > 0 else 0.0
+    else:
+        support_fraction = (
+            math.log1p(max(0, paper_count)) - math.log1p(max(0, min_paper_count))
+        ) / (
+            math.log1p(max(0, max_paper_count))
+            - math.log1p(max(0, min_paper_count))
+        )
+    support_fraction = max(0.0, min(1.0, support_fraction))
+    edge_opacity = round(0.28 + (0.72 * support_fraction), 3)
     edge_length = int(
         90
         + 2.2
@@ -234,8 +332,14 @@ def _edge_payload(edge: Mapping[str, Any], node_sizes: Mapping[str, float]) -> d
         "evidence_count": evidence_count,
         "context_evidence_count": int(edge.get("context_evidence_count") or 0),
         "arrows": {"to": {"enabled": directed, "scaleFactor": 0.35}},
-        "color": {"color": color, "highlight": color, "hover": color, "opacity": 0.86},
-        "width": 2.0,
+        "color": {
+            "color": color,
+            "highlight": color,
+            "hover": color,
+            "opacity": edge_opacity,
+        },
+        "width": _INTERACTION_EDGE_WIDTH,
+        "support_intensity": support_fraction,
         "length": edge_length,
         "smooth": {"enabled": True, "type": "dynamic"},
         "font": {
@@ -447,8 +551,18 @@ class NetworkRepository:
             node_sizes[str(payload["id"])] = float(payload["size"])
             node_id = str(payload.pop("id"))
             net.add_node(node_id, **payload)
+        edge_paper_counts = [
+            max(0, int(edge.get("paper_count") or 0)) for edge in edges
+        ] or [0]
+        min_edge_paper_count = min(edge_paper_counts)
+        max_edge_paper_count = max(edge_paper_counts)
         for edge in edges:
-            payload = _edge_payload(edge, node_sizes)
+            payload = _edge_payload(
+                edge,
+                node_sizes,
+                min_paper_count=min_edge_paper_count,
+                max_paper_count=max_edge_paper_count,
+            )
             source = str(payload.pop("from"))
             target = str(payload.pop("to"))
             net.add_edge(source, target, **payload)
@@ -688,6 +802,120 @@ class NetworkRepository:
         )
         return payload
 
+    def closed_loop_graph(
+        self,
+        job_id: str,
+        *,
+        relation_support_min: int = 1,
+    ) -> dict[str, Any]:
+        """Return all closed interaction components and remove open links.
+
+        Loop detection treats the graph as undirected only for topology. The
+        original normalized subject, predicate, object order and arrow direction
+        remain unchanged in the returned graph. Parallel predicates between the
+        same endpoints count as one structural link for loop detection. Every
+        returned link belongs to a cycle; bridge links and nodes left without a
+        loop-supported edge are omitted. All separate loop components are returned.
+        """
+
+        support_min = max(0, int(relation_support_min))
+        with self.connection(job_id) as connection:
+            all_edges = [
+                _row_dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT e.*, s.label AS subject_label, o.label AS object_label
+                    FROM edges e
+                    JOIN nodes s ON s.id = e.subject_id
+                    JOIN nodes o ON o.id = e.object_id
+                    WHERE e.paper_count >= ?
+                    ORDER BY e.paper_count DESC, e.evidence_count DESC, e.id
+                    """,
+                    (support_min,),
+                ).fetchall()
+            ]
+            bridge_pairs = _bridge_pairs(all_edges)
+            edges = [
+                edge
+                for edge in all_edges
+                if _undirected_pair(edge["subject_id"], edge["object_id"])
+                not in bridge_pairs
+            ]
+            endpoint_ids = {
+                str(endpoint)
+                for edge in edges
+                for endpoint in (edge["subject_id"], edge["object_id"])
+            }
+            nodes = self._nodes_by_ids(connection, sorted(endpoint_ids))
+            meta_row = connection.execute(
+                "SELECT value FROM meta WHERE key = 'stats'"
+            ).fetchone()
+            stats = json.loads(meta_row["value"]) if meta_row else {}
+
+        parent = {node_id: node_id for node_id in endpoint_ids}
+
+        def find(node_id: str) -> str:
+            root = node_id
+            while parent[root] != root:
+                root = parent[root]
+            while parent[node_id] != node_id:
+                next_node = parent[node_id]
+                parent[node_id] = root
+                node_id = next_node
+            return root
+
+        def union(left: str, right: str) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for edge in edges:
+            union(str(edge["subject_id"]), str(edge["object_id"]))
+
+        members: dict[str, list[str]] = {}
+        for node_id in endpoint_ids:
+            members.setdefault(find(node_id), []).append(node_id)
+        ordered_components = sorted(
+            members.values(),
+            key=lambda values: (-len(values), sorted(values)[0] if values else ""),
+        )
+        component_by_node: dict[str, int] = {}
+        component_sizes: list[dict[str, int]] = []
+        for component_number, values in enumerate(ordered_components, start=1):
+            for node_id in values:
+                component_by_node[node_id] = component_number
+            component_sizes.append(
+                {"component_id": component_number, "node_count": len(values)}
+            )
+
+        payload = self._pyvis_payload(nodes, edges)
+        for node in payload["nodes"]:
+            node["component_id"] = component_by_node.get(str(node.get("id")), 0)
+        edge_counts: dict[int, int] = {}
+        for edge in payload["edges"]:
+            component_id = component_by_node.get(str(edge.get("from")), 0)
+            edge["component_id"] = component_id
+            edge_counts[component_id] = edge_counts.get(component_id, 0) + 1
+        for item in component_sizes:
+            item["edge_count"] = edge_counts.get(item["component_id"], 0)
+
+        payload.update(
+            {
+                "mode": "closed_loops",
+                "relation_support_min": support_min,
+                "component_count": len(component_sizes),
+                "component_sizes": component_sizes,
+                "returned_node_count": len(nodes),
+                "returned_edge_count": len(edges),
+                "removed_open_edge_count": len(all_edges) - len(edges),
+                "candidate_edge_count": len(all_edges),
+                "network_stats": stats,
+            }
+        )
+        return payload
+
+
     def full_graph(
         self,
         job_id: str,
@@ -745,6 +973,80 @@ class NetworkRepository:
             }
         )
         return payload
+
+    def displayed_network_rows(
+        self,
+        job_id: str,
+        edge_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Return the eight plain spreadsheet columns for visible relations."""
+
+        selected_ids = list(
+            dict.fromkeys(
+                str(edge_id or "").strip()
+                for edge_id in edge_ids
+                if str(edge_id or "").strip()
+            )
+        )
+        if not selected_ids:
+            return []
+
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        batch_size = 800
+        with self.connection(job_id) as connection:
+            for start in range(0, len(selected_ids), batch_size):
+                batch = selected_ids[start : start + batch_size]
+                placeholders = ",".join("?" for _ in batch)
+                relation_rows = connection.execute(
+                    f"""
+                    SELECT
+                        e.id AS edge_id,
+                        e.predicate,
+                        s.normalized_id AS subject_normalized_id,
+                        s.label AS subject_label,
+                        s.entity_type AS subject_type,
+                        o.normalized_id AS object_normalized_id,
+                        o.label AS object_label,
+                        o.entity_type AS object_type
+                    FROM edges e
+                    JOIN nodes s ON s.id = e.subject_id
+                    JOIN nodes o ON o.id = e.object_id
+                    WHERE e.id IN ({placeholders})
+                    """,  # noqa: S608 -- placeholders are generated, values are bound
+                    tuple(batch),
+                ).fetchall()
+                for row in relation_rows:
+                    item = _row_dict(row)
+                    rows_by_id[str(item["edge_id"])] = item
+
+        result: list[dict[str, Any]] = []
+        for edge_id in selected_ids:
+            row = rows_by_id.get(edge_id)
+            if not row:
+                continue
+            subject_label = str(
+                row.get("subject_label") or row.get("subject_normalized_id") or ""
+            )
+            object_label = str(
+                row.get("object_label") or row.get("object_normalized_id") or ""
+            )
+            result.append(
+                {
+                    "subject": subject_label,
+                    "subject_normalized_id": str(
+                        row.get("subject_normalized_id") or ""
+                    ),
+                    "subject_type": str(row.get("subject_type") or ""),
+                    "predicate": str(row.get("predicate") or ""),
+                    "object": object_label,
+                    "object_normalized_id": str(
+                        row.get("object_normalized_id") or ""
+                    ),
+                    "object_type": str(row.get("object_type") or ""),
+                    "direction": f"{subject_label} -> {object_label}",
+                }
+            )
+        return result
 
     def neighborhood(
         self,
@@ -1013,12 +1315,7 @@ class NetworkRepository:
         with self.connection(job_id) as connection:
             node = connection.execute(
                 """
-                SELECT n.*,
-                       (
-                           SELECT COUNT(*) FROM edges e
-                           WHERE e.predicate = 'binding'
-                             AND (e.subject_id = n.id OR e.object_id = n.id)
-                       ) AS undirected_count
+                SELECT n.*, 0 AS undirected_count
                 FROM nodes n WHERE n.id = ?
                 """,
                 (node_id,),
@@ -1056,17 +1353,9 @@ class NetworkRepository:
                 for row in connection.execute(
                     """
                     SELECT predicate,
-                           SUM(
-                               CASE WHEN predicate <> 'binding' AND subject_id = ?
-                                    THEN 1 ELSE 0 END
-                           ) AS outgoing,
-                           SUM(
-                               CASE WHEN predicate <> 'binding' AND object_id = ?
-                                    THEN 1 ELSE 0 END
-                           ) AS incoming,
-                           SUM(
-                               CASE WHEN predicate = 'binding' THEN 1 ELSE 0 END
-                           ) AS undirected,
+                           SUM(CASE WHEN subject_id = ? THEN 1 ELSE 0 END) AS outgoing,
+                           SUM(CASE WHEN object_id = ? THEN 1 ELSE 0 END) AS incoming,
+                           0 AS undirected,
                            SUM(evidence_count) AS evidence_count
                     FROM edges WHERE subject_id = ? OR object_id = ?
                     GROUP BY predicate ORDER BY evidence_count DESC, predicate
@@ -1105,7 +1394,7 @@ class NetworkRepository:
                 ).fetchall()
             ]
         payload = {**_row_dict(edge), "cell_contexts": contexts}
-        payload["directed"] = str(payload.get("predicate") or "") != "binding"
+        payload["directed"] = True
         return payload
 
     def edge_evidence(self, job_id: str, edge_id: str, *, limit: int) -> dict[str, Any]:

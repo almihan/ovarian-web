@@ -8,6 +8,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from backend import deployment_flags
+
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -65,10 +67,19 @@ class Settings:
     app_name: str
     environment: str
     public_base_url: str
+    public_precomputed_only: bool
+    precomputed_corpora_dir: Path
+    monthly_updates_enabled: bool
+    monthly_update_max_new_papers: int
+    monthly_update_poll_seconds: int
+    monthly_update_timeout_seconds: int
+    monthly_update_token: str
+    monthly_update_text_mode: str
 
     data_dir: Path
     artifact_local_dir: Path
     cell_model_cache_dir: Path
+    reference_data_cache_dir: Path
     local_annotation_jobs_dir: Path
     relation_jobs_dir: Path
     run_retention_seconds: int
@@ -105,6 +116,7 @@ class Settings:
     cell_nen_model: str
     cell_nen_revision: str | None
     cell_disable_abbreviations: bool
+    cell_normalization_method_log: bool
     cell_cpu_threads: int
     cell_ner_text_batch_size: int
     cell_ner_window_batch_size: int
@@ -123,10 +135,10 @@ class Settings:
     relation_retry_base_seconds: int
     relation_progress_update_every: int
     relation_max_output_tokens: int
+    relation_max_output_tokens_ceiling: int
     relation_reasoning_effort: str
     relation_prompt_cache_key: str
     relation_prompt_cache_shards: int
-    relation_require_hormone_gene_cell_context: bool
 
     network_initial_nodes: int
     network_max_initial_nodes: int
@@ -140,8 +152,10 @@ class Settings:
             self.data_dir,
             self.artifact_local_dir,
             self.cell_model_cache_dir,
+            self.reference_data_cache_dir,
             self.local_annotation_jobs_dir,
             self.relation_jobs_dir,
+            self.precomputed_corpora_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -172,6 +186,17 @@ class Settings:
 
 
 def get_settings() -> Settings:
+    on_railway = any(
+        os.getenv(name)
+        for name in ("RAILWAY_ENVIRONMENT_ID", "RAILWAY_SERVICE_ID", "RAILWAY_PUBLIC_DOMAIN")
+    )
+    environment = (os.getenv("APP_ENV") or ("production" if on_railway else "development")).strip()
+    automatic_public_mode = on_railway or environment.casefold() in {"production", "staging"}
+    public_default = (
+        automatic_public_mode
+        if deployment_flags.PUBLIC_PRECOMPUTED_ONLY is None
+        else deployment_flags.PUBLIC_PRECOMPUTED_ONLY
+    )
     data_dir_raw = (
         os.getenv("APP_DATA_DIR")
         or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
@@ -196,18 +221,87 @@ def get_settings() -> Settings:
         choices={"local", "s3"},
     )
 
-    artifact_prefix = (os.getenv("ARTIFACT_PREFIX") or "ovarian-network").strip("/")
+    artifact_prefix = (
+        os.getenv("ARTIFACT_PREFIX") or "ovarian-network-hgnc-mesh"
+    ).strip("/")
+
+    # Structured relation output can exceed a small cap because GPT-5 output
+    # accounting includes reasoning and formatting tokens. Keep a practical
+    # first-attempt floor and allow bounded expansion on retries.
+    relation_max_output_tokens = _as_int(
+        os.getenv("RELATION_MAX_OUTPUT_TOKENS"),
+        default=4_096,
+        minimum=4_096,
+        maximum=32_768,
+    )
+    relation_max_output_tokens_ceiling = max(
+        relation_max_output_tokens,
+        _as_int(
+            os.getenv("RELATION_MAX_OUTPUT_TOKENS_CEILING"),
+            default=32_768,
+            minimum=4_096,
+            maximum=32_768,
+        ),
+    )
+
+    cell_annotation_backend = _as_choice(
+        os.getenv("CELL_ANNOTATION_BACKEND"),
+        default="modal",
+        choices={"modal", "local", "disabled"},
+    )
+    explicit_cell_cache = (os.getenv("CELL_MODEL_CACHE_DIR") or "").strip()
+    if explicit_cell_cache:
+        cell_model_cache_dir = Path(explicit_cell_cache).expanduser().resolve()
+    elif cell_annotation_backend == "local":
+        # Keep large Hugging Face checkpoints and the generated Cell Ontology
+        # embedding matrix outside the extracted project. Replacing the ZIP or
+        # moving the source directory must not force an expensive rebuild.
+        cache_home = Path(
+            os.getenv("XDG_CACHE_HOME") or (Path.home() / ".cache")
+        ).expanduser()
+        cell_model_cache_dir = (
+            cache_home / "ovarian-network" / "cellexlink"
+        ).resolve()
+    else:
+        cell_model_cache_dir = (data_dir / "model_cache").resolve()
 
     return Settings(
-        app_name=os.getenv("APP_NAME", "Ovarian Network"),
-        environment=os.getenv("APP_ENV", "development"),
+        app_name=os.getenv("APP_NAME", "Ovarian Network — HGNC/MeSH"),
+        environment=environment,
         public_base_url=_public_base_url(),
+        public_precomputed_only=_as_bool(os.getenv("PUBLIC_PRECOMPUTED_ONLY"), default=public_default),
+        precomputed_corpora_dir=Path(
+            os.getenv("PRECOMPUTED_CORPORA_DIR") or str(data_dir / "precomputed_corpora")
+        ).expanduser().resolve(),
+        monthly_updates_enabled=_as_bool(
+            os.getenv("MONTHLY_UPDATES_ENABLED"), default=deployment_flags.MONTHLY_UPDATES_ENABLED
+        ),
+        monthly_update_max_new_papers=_as_int(
+            os.getenv("MONTHLY_UPDATE_MAX_NEW_PAPERS"),
+            default=deployment_flags.MONTHLY_UPDATE_MAX_NEW_PAPERS,
+            minimum=0, maximum=100_000,
+        ),
+        monthly_update_poll_seconds=_as_int(
+            os.getenv("MONTHLY_UPDATE_POLL_SECONDS"), default=2, minimum=1, maximum=60,
+        ),
+        monthly_update_timeout_seconds=_as_int(
+            os.getenv("MONTHLY_UPDATE_TIMEOUT_SECONDS"), default=86_400,
+            minimum=60, maximum=604_800,
+        ),
+        monthly_update_token=(os.getenv("MONTHLY_UPDATE_TOKEN") or "").strip(),
+        monthly_update_text_mode=_as_choice(
+            os.getenv("MONTHLY_UPDATE_TEXT_MODE"), default="fulltext", choices={"abstract", "fulltext"},
+        ),
         data_dir=data_dir,
         artifact_local_dir=Path(
             os.getenv("ARTIFACT_LOCAL_DIR", str(data_dir / "artifacts"))
         ).expanduser().resolve(),
-        cell_model_cache_dir=Path(
-            os.getenv("CELL_MODEL_CACHE_DIR", str(data_dir / "model_cache"))
+        cell_model_cache_dir=cell_model_cache_dir,
+        reference_data_cache_dir=Path(
+            os.getenv(
+                "REFERENCE_DATA_CACHE_DIR",
+                str(data_dir / "reference_data"),
+            )
         ).expanduser().resolve(),
         local_annotation_jobs_dir=Path(
             os.getenv(
@@ -248,7 +342,7 @@ def get_settings() -> Settings:
             maximum=604_800,
         ),
         ncbi_email=os.getenv("NCBI_EMAIL", "").strip(),
-        ncbi_tool=os.getenv("NCBI_TOOL", "ovarian_network_web").strip(),
+        ncbi_tool=os.getenv("NCBI_TOOL", "ovarian_network_hgnc_mesh").strip(),
         ncbi_api_key=os.getenv("NCBI_API_KEY") or None,
         retrieval_keyword_limit=_as_int(
             os.getenv("RETRIEVAL_KEYWORD_LIMIT"),
@@ -270,7 +364,7 @@ def get_settings() -> Settings:
         ),
         pubtator3_batch_size=_as_int(
             os.getenv("PUBTATOR3_BATCH_SIZE"),
-            default=20,
+            default=100,
             minimum=1,
             maximum=100,
         ),
@@ -288,19 +382,15 @@ def get_settings() -> Settings:
             os.getenv("PUBTATOR3_RESOLVE_PREFERRED_LABELS"),
             default=True,
         ),
-        cell_annotation_backend=_as_choice(
-            os.getenv("CELL_ANNOTATION_BACKEND"),
-            default="modal",
-            choices={"modal", "local", "disabled"},
-        ),
+        cell_annotation_backend=cell_annotation_backend,
         cell_local_device=_as_choice(
             os.getenv("CELL_LOCAL_DEVICE"),
             default="cpu",
             choices={"cpu", "auto"},
         ),
         modal_app_name=(
-            os.getenv("MODAL_APP_NAME", "ovarian-cellexlink").strip()
-            or "ovarian-cellexlink"
+            os.getenv("MODAL_APP_NAME", "ovarian-cellexlink-hgnc-mesh").strip()
+            or "ovarian-cellexlink-hgnc-mesh"
         ),
         modal_function_name=(
             os.getenv("MODAL_FUNCTION_NAME", "annotate_bundle").strip()
@@ -319,6 +409,10 @@ def get_settings() -> Settings:
         cell_nen_revision=(os.getenv("CELL_NEN_REVISION") or "").strip() or None,
         cell_disable_abbreviations=_as_bool(
             os.getenv("CELL_DISABLE_ABBREVIATIONS"),
+            default=False,
+        ),
+        cell_normalization_method_log=_as_bool(
+            os.getenv("CELL_NORMALIZATION_METHOD_LOG"),
             default=False,
         ),
         cell_cpu_threads=_as_int(
@@ -341,7 +435,7 @@ def get_settings() -> Settings:
         ),
         cell_nen_batch_size=_as_int(
             os.getenv("CELL_NEN_BATCH_SIZE"),
-            default=64,
+            default=128,
             minimum=1,
             maximum=512,
         ),
@@ -400,30 +494,25 @@ def get_settings() -> Settings:
             minimum=1,
             maximum=100,
         ),
-        relation_max_output_tokens=_as_int(
-            os.getenv("RELATION_MAX_OUTPUT_TOKENS"),
-            default=1200,
-            minimum=256,
-            maximum=4096,
-        ),
+        relation_max_output_tokens=relation_max_output_tokens,
+        relation_max_output_tokens_ceiling=relation_max_output_tokens_ceiling,
         relation_reasoning_effort=_as_choice(
             os.getenv("RELATION_REASONING_EFFORT"),
-            default="none",
+            default="low",
             choices={"none", "low", "medium", "high", "xhigh"},
         ),
         relation_prompt_cache_key=(
-            os.getenv("RELATION_PROMPT_CACHE_KEY", "ovarian-relations-v1").strip()
-            or "ovarian-relations-v1"
+            os.getenv(
+                "RELATION_PROMPT_CACHE_KEY",
+                "ovarian-relations-four-predicates",
+            ).strip()
+            or "ovarian-relations-four-predicates"
         )[:64],
         relation_prompt_cache_shards=_as_int(
             os.getenv("RELATION_PROMPT_CACHE_SHARDS"),
             default=32,
             minimum=1,
             maximum=128,
-        ),
-        relation_require_hormone_gene_cell_context=_as_bool(
-            os.getenv("RELATION_REQUIRE_HORMONE_GENE_CELL_CONTEXT"),
-            default=False,
         ),
         network_initial_nodes=_as_int(
             os.getenv("NETWORK_INITIAL_NODES"),

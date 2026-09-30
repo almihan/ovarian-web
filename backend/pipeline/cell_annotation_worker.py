@@ -1,35 +1,40 @@
-"""Lean chunk-level CellExLink recognition and normalization routines.
+"""Abbreviation-aware CellExLink annotation worker.
 
-The Railway FastAPI process never imports this module. A Modal T4 worker calls
-``run_ner`` and then ``run_nen`` sequentially. Each routine explicitly closes
-its model before the next checkpoint is loaded, while all per-job intermediates
-remain on ephemeral disk.
+The prepass supplies locked cell, hormone and gene annotations. NER runs on
+unchanged text, followed by boundary repair and fragment rejection. Cell NEN
+uses document definitions, static abbreviations, exact ontology aliases and
+thresholded vector top-1. Weak/unresolved candidates cannot seed propagation.
 """
 
 from __future__ import annotations
 
 import gzip
 import json
+import logging
 import os
-import sqlite3
 import tempfile
-import time
-from collections import defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence
 
 from backend.cellexlink_lite.normalization import (
+    NORMALIZATION_METHODS,
     CellOntologyNormalizer,
-    NormalizationRequest,
-    extract_document_abbreviations,
-    is_abbreviation_like,
-    plural_normalize_text,
+    NormalizationDecision,
+    RescuedMention,
+    build_document_text,
+    canonical_abbreviation_key,
 )
-from backend.cellexlink_lite.recognition import ChunkNER
-from backend.cellexlink_lite.resources import (
-    DEFAULT_ABBREVIATIONS_PATH,
-    DEFAULT_ONTOLOGY_PATH,
+from backend.pipeline.abbreviation_prepass import (
+    load_document_context,
+    run_abbreviation_prepass,
 )
+from backend.pipeline.entity_text_normalization import spans_overlap
+from backend.cellexlink_lite.recognition import ChunkNER, EntitySpan
+from backend.pipeline.entity_span_rules import repair_cell_spans, prune_cell_fragments, sanitize_source_annotations
+from backend.pipeline.document_entity_recovery import default_cell_span_resources
+
+logger = logging.getLogger(__name__)
 
 SOURCE_FIELDS = (
     "base",
@@ -84,10 +89,17 @@ def _atomic_write_gzip_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> i
         ) as raw_handle:
             temp_path = Path(raw_handle.name)
             count = 0
-            with gzip.GzipFile(fileobj=raw_handle, mode="wb", compresslevel=6) as gzip_handle:
+            with gzip.GzipFile(
+                fileobj=raw_handle,
+                mode="wb",
+                compresslevel=6,
+                mtime=0,
+            ) as gzip_handle:
                 for row in rows:
                     payload = json.dumps(
-                        row, ensure_ascii=False, separators=(",", ":")
+                        row,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ).encode("utf-8")
                     gzip_handle.write(payload)
                     gzip_handle.write(b"\n")
@@ -123,7 +135,6 @@ def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
             yield row
 
 
-
 class ProgressSink(Protocol):
     def emit(
         self,
@@ -149,6 +160,49 @@ def _mention_id(record: Mapping[str, Any], start: int, end: int) -> str:
     return f"{base}:cell:{start}:{end}"
 
 
+def _canonical_entity_type(row: Mapping[str, Any]) -> str:
+    value = str(row.get("entity_type") or row.get("obj") or "").casefold()
+    if value in {"cell", "cell_type", "cell type"}:
+        return "cell"
+    if value in {"hormone", "chemical"}:
+        return "hormone"
+    return value
+
+
+def _locked_spans(entry: Mapping[str, Any]) -> dict[str, list[tuple[int, int, str]]]:
+    output: dict[str, list[tuple[int, int, str]]] = {}
+    path_value = entry.get("abbreviation_annotations_path")
+    if not path_value:
+        return output
+    path = Path(str(path_value))
+    if not path.is_file():
+        return output
+    for row in _iter_jsonl(path):
+        if not bool(row.get("locked")):
+            continue
+        try:
+            start = int(row.get("start"))
+            end = int(row.get("end"))
+        except (TypeError, ValueError):
+            continue
+        output.setdefault(str(row.get("chunk_id") or ""), []).append(
+            (start, end, _canonical_entity_type(row))
+        )
+    return output
+
+
+def _resolve_local_annotation_conflicts(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply the same longest-span policy independently to each chunk."""
+    from backend.pipeline.entity_overlap import prefer_longest_spans
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for row in prune_cell_fragments(rows):
+        grouped.setdefault(str(row.get("chunk_id") or ""), []).append(row)
+    return [annotation for chunk_rows in grouped.values()
+            for annotation in prefer_longest_spans(chunk_rows)]
+
+
 def _process_ner_group(
     *,
     ner: ChunkNER,
@@ -156,7 +210,7 @@ def _process_ner_group(
     text_batch_size: int,
     model_name: str,
     pipeline_version: str,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     all_records: list[dict[str, Any]] = []
     ranges: list[tuple[int, int]] = []
     for _entry, records in group:
@@ -170,13 +224,36 @@ def _process_ner_group(
         text_batch_size=text_batch_size,
     )
     total_mentions = 0
+    blocked_mentions = 0
     total_chunks = len(all_records)
 
     for (entry, records), (start, end) in zip(group, ranges):
         mention_rows: list[dict[str, Any]] = []
+        protected = _locked_spans(entry)
         for record, spans in zip(records, predictions[start:end]):
+            text = str(record.get("chunk") or "")
+            resources = default_cell_span_resources()
+            repaired = repair_cell_spans(text, [(span.start, span.end) for span in spans],
+                known_cell=lambda value: resources.resolve_cell(value).status == "resolved_target",
+                known_gene=lambda value: bool(resources.genes and resources.genes.resolve(value)),
+                cell_surface_allowed=resources.cell_surface_allowed)
+            spans = [EntitySpan(text[a:b], a, b, "cell_type") for a,b in repaired]
             seen_spans: set[tuple[int, int, str]] = set()
             for span in spans:
+                # A locked cell blocks only an equal or longer competitor.
+                # Larger complete ontology-backed phrases remain eligible.
+                if any(
+                    locked_type == "cell"
+                    and locked_end - locked_start >= span.end - span.start
+                    and spans_overlap(
+                        (span.start, span.end), (locked_start, locked_end)
+                    )
+                    for locked_start, locked_end, locked_type in protected.get(
+                        str(record.get("chunk_id") or ""), []
+                    )
+                ):
+                    blocked_mentions += 1
+                    continue
                 key = (span.start, span.end, span.text)
                 if key in seen_spans:
                     continue
@@ -192,6 +269,7 @@ def _process_ner_group(
                         "entity_type": "cell_type",
                         "ner_label": span.label,
                         "ner_model": model_name,
+                        "recognition_source": "cell_ner",
                     }
                 )
                 mention_rows.append(row)
@@ -214,7 +292,7 @@ def _process_ner_group(
         )
         total_mentions += row_count
 
-    return total_chunks, total_mentions
+    return total_chunks, total_mentions, blocked_mentions
 
 
 def run_ner(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict[str, Any]:
@@ -225,7 +303,12 @@ def run_ner(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
         "papers_processed": 0,
         "chunks_processed": 0,
         "mentions_detected": 0,
+        "mentions_blocked_by_ab3p": 0,
         "model_loaded": False,
+        "recognition_requested_device": str(
+            getattr(args, "device", "auto") or "auto"
+        ),
+        "recognition_compute_device": "not loaded",
     }
     if not entries:
         progress.emit(
@@ -254,8 +337,10 @@ def run_ner(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
             doc_stride=args.doc_stride,
             window_batch_size=args.window_batch_size,
             cpu_threads=args.cpu_threads,
+            device=str(getattr(args, "device", "auto") or "auto"),
         )
         stats["model_loaded"] = True
+        stats["recognition_compute_device"] = ner.compute_device
         progress.emit(
             stage="recognition",
             percent=5,
@@ -272,7 +357,7 @@ def run_ner(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
             nonlocal group, group_record_count
             if not group:
                 return
-            chunk_count, mention_count = _process_ner_group(
+            chunk_count, mention_count, blocked_count = _process_ner_group(
                 ner=ner,  # type: ignore[arg-type]
                 group=group,
                 text_batch_size=args.text_batch_size,
@@ -282,6 +367,7 @@ def run_ner(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
             stats["papers_processed"] += len(group)
             stats["chunks_processed"] += chunk_count
             stats["mentions_detected"] += mention_count
+            stats["mentions_blocked_by_ab3p"] += blocked_count
             percent = 5 + 95 * stats["papers_processed"] / max(1, total_papers)
             progress.emit(
                 stage="recognition",
@@ -308,6 +394,7 @@ def run_ner(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
         flush_group()
     finally:
         if ner is not None:
+            stats["recognition_compute_device"] = ner.compute_device
             ner.close()
 
     progress.emit(
@@ -323,136 +410,171 @@ def run_ner(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
     return stats
 
 
-def _connect_work_database(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS requests (
-            document_key TEXT NOT NULL,
-            normalized_text TEXT NOT NULL,
-            mention_text TEXT NOT NULL,
-            PRIMARY KEY (document_key, normalized_text)
-        ) WITHOUT ROWID
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS results (
-            document_key TEXT NOT NULL,
-            normalized_text TEXT NOT NULL,
-            result_json TEXT NOT NULL,
-            PRIMARY KEY (document_key, normalized_text)
-        ) WITHOUT ROWID
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS document_abbreviations (
-            document_key TEXT PRIMARY KEY,
-            lookup_json TEXT NOT NULL
-        ) WITHOUT ROWID
-        """
-    )
-    return connection
-
-
-def _document_text_by_key(chunk_path: Path) -> dict[str, str]:
-    parts: dict[str, list[str]] = defaultdict(list)
-    for row in _iter_jsonl(chunk_path):
-        text = str(row.get("chunk") or "").strip()
-        if text:
-            parts[str(row.get("doc_key") or "")].append(text)
-    return {key: "\n".join(values) for key, values in parts.items()}
-
-
-def _load_context_for_documents(
-    connection: sqlite3.Connection,
-    document_keys: set[str],
-) -> dict[str, dict[str, str]]:
-    keys = sorted(key for key in document_keys if key)
-    if not keys:
-        return {}
-    context: dict[str, dict[str, str]] = {}
-    for start in range(0, len(keys), 400):
-        batch = keys[start : start + 400]
-        placeholders = ",".join("?" for _ in batch)
-        rows = connection.execute(
-            f"SELECT document_key, lookup_json FROM document_abbreviations "
-            f"WHERE document_key IN ({placeholders})",  # noqa: S608
-            batch,
-        ).fetchall()
-        for document_key, raw_lookup in rows:
-            try:
-                lookup = json.loads(raw_lookup)
-            except json.JSONDecodeError:
-                lookup = {}
-            if isinstance(lookup, dict):
-                context[str(document_key)] = {
-                    str(key): str(value) for key, value in lookup.items()
-                }
-    return context
-
-
-def _best_candidate_payload(result_payload: Mapping[str, Any]) -> dict[str, Any] | None:
-    candidates = result_payload.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
-        return None
-    best = candidates[0]
-    return dict(best) if isinstance(best, dict) else None
-
-
-def _final_annotation_row(
+def _annotation_row_from_decision(
     mention: Mapping[str, Any],
-    result_payload: Mapping[str, Any] | None,
+    decision: NormalizationDecision,
     *,
     nen_model: str,
 ) -> dict[str, Any]:
     row = dict(mention)
     row["nen_model"] = nen_model
-    best = _best_candidate_payload(result_payload or {})
-    if best is None:
-        row["normalization_status"] = "unresolved"
-        row["cell_ontology_id"] = None
-        row["cell_ontology_label"] = None
-        return row
-
-    row.update(
-        {
-            "normalization_status": "normalized",
-            "cell_ontology_id": best.get("identifier"),
-            "cell_ontology_label": best.get("preferred_label"),
-            "normalization_score": best.get("final_score"),
-            "normalization_embedding_score": best.get("embedding_score"),
-            "normalization_source": best.get("source"),
-        }
-    )
-    for key in (
-        "abbreviation_method",
-        "expanded_long_form",
-        "ab3p_method",
-        "ab3p_matched_key",
-        "ab3p_match_score",
-    ):
-        if best.get(key) is not None:
-            row[key] = best[key]
+    row.update(decision.to_annotation_fields())
     return row
 
 
+def _rescued_annotation_row(
+    rescued: RescuedMention,
+    *,
+    ner_model: str,
+    nen_model: str,
+) -> dict[str, Any]:
+    row = _source_projection(rescued.chunk.source)
+    row.update(
+        {
+            "mention_id": _mention_id(
+                rescued.chunk.source,
+                rescued.start,
+                rescued.end,
+            ),
+            "mention": rescued.mention,
+            "start": rescued.start,
+            "end": rescued.end,
+            "offset_scope": "chunk",
+            "entity_type": "cell_type",
+            "ner_label": "DOCUMENT_RESCUE",
+            "ner_model": ner_model,
+            "nen_model": nen_model,
+            "recognition_source": rescued.decision.normalization_source,
+        }
+    )
+    row.update(rescued.decision.to_annotation_fields())
+    return row
+
+
+def _debug_mention_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "mention": row.get("mention"),
+        "chunk_id": row.get("chunk_id"),
+        "start": row.get("start"),
+        "end": row.get("end"),
+        "normalized_id": row.get("cell_ontology_id"),
+        "preferred_label": row.get("cell_ontology_label"),
+    }
+    for key in (
+        "matched_abbreviation_key",
+        "matched_static_abbreviation_key",
+        "expanded_long_form",
+        "abbreviation_key_cosine",
+        "ab3p_key_cosine",
+        "ab3p_match_method",
+        "ontology_raw_cosine",
+        "matched_ontology_alias",
+    ):
+        value = row.get(key)
+        if value is not None:
+            output[key] = value
+    return output
+
+
+def _log_document_methods(
+    *,
+    document_key: str,
+    ab3p_status: str,
+    output_rows: Sequence[Mapping[str, Any]],
+    definition_count: int,
+    validated_definition_count: int,
+) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {
+        method: [] for method in NORMALIZATION_METHODS
+    }
+    for row in output_rows:
+        source = str(row.get("normalization_source") or "unresolved")
+        grouped.setdefault(source, []).append(_debug_mention_payload(row))
+
+    counts = {method: len(grouped.get(method, [])) for method in NORMALIZATION_METHODS}
+    logger.info(
+        "[CELL_NORM_DEBUG] document=%s ab3p_status=%s ab3p_definitions=%d "
+        "validated_ab3p_definitions=%d counts=%s",
+        document_key,
+        ab3p_status,
+        definition_count,
+        validated_definition_count,
+        json.dumps(counts, ensure_ascii=False, separators=(",", ":")),
+    )
+    for method in NORMALIZATION_METHODS:
+        mentions = grouped.get(method, [])
+        if not mentions:
+            continue
+        logger.info(
+            "[CELL_NORM_DEBUG] document=%s method=%s count=%d mentions=%s",
+            document_key,
+            method,
+            len(mentions),
+            json.dumps(mentions, ensure_ascii=False, separators=(",", ":")),
+        )
+
+
+def _row_sort_key(
+    row: Mapping[str, Any],
+    *,
+    chunk_order: Mapping[str, int],
+) -> tuple[int, int, int, str, str]:
+    try:
+        start = int(row.get("start"))
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        end = int(row.get("end"))
+    except (TypeError, ValueError):
+        end = start
+    return (
+        chunk_order.get(str(row.get("chunk_id") or ""), 10**9),
+        start,
+        end,
+        str(row.get("mention") or "").casefold(),
+        str(row.get("normalization_source") or ""),
+    )
+
+
 def run_nen(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict[str, Any]:
+    """Normalize NER spans using the saved pre-NER abbreviation context."""
+
     entries = [dict(entry) for entry in manifest["entries"]]
     total_papers = len(entries)
+    aggregate_methods: Counter[str] = Counter()
+    unique_mentions: set[tuple[str, str]] = set()
     stats: dict[str, Any] = {
         "papers_total": total_papers,
         "papers_processed": 0,
+        "ner_mention_occurrences": 0,
         "mention_occurrences": 0,
+        "cell_occurrences": 0,
+        "hormone_occurrences": 0,
         "unique_mentions": 0,
         "normalized_occurrences": 0,
         "unresolved_occurrences": 0,
         "documents_with_abbreviation_context": 0,
+        "ab3p_health_check": "completed_in_prepass",
+        "ab3p_document_statuses": {
+            "definitions_found": 0,
+            "no_definitions": 0,
+            "disabled": 0,
+        },
+        "ab3p_definitions": 0,
+        "validated_ab3p_definitions": 0,
+        "ab3p_cell_annotations": 0,
+        "ab3p_hormone_annotations": 0,
+        "rescued_occurrences": 0,
+        "normalization_methods": {method: 0 for method in NORMALIZATION_METHODS},
+        "normalization_method_log": bool(
+            getattr(args, "normalization_method_log", False)
+        ),
         "model_loaded": False,
+        "normalization_requested_device": str(
+            getattr(args, "device", "auto") or "auto"
+        ),
+        "normalization_compute_device": "not loaded",
+        "ontology_embedding_cache_reused": None,
     }
     if not entries:
         progress.emit(
@@ -464,13 +586,31 @@ def run_nen(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
         )
         return stats
 
-    work_database_path = Path(args.work_database)
-    work_database_path.unlink(missing_ok=True)
-    connection = _connect_work_database(work_database_path)
-    normalizer: CellOntologyNormalizer | None = None
+    progress.emit(
+        stage="normalization",
+        percent=1,
+        message="Preparing the local CellExLink normalization resources...",
+        stats=stats,
+        force=True,
+    )
 
+    normalizer: CellOntologyNormalizer | None = None
     try:
-        # Loading ontology and abbreviation TSV resources does not load a model.
+        def report_normalizer_progress(
+            stage: str,
+            percent: float,
+            message: str,
+            detail_stats: Mapping[str, Any],
+        ) -> None:
+            merged_stats = {**stats, **dict(detail_stats)}
+            progress.emit(
+                stage=stage,
+                percent=percent,
+                message=message,
+                stats=merged_stats,
+                force=False,
+            )
+
         normalizer = CellOntologyNormalizer(
             model_name_or_path=args.model,
             model_cache_dir=args.model_cache_dir,
@@ -480,218 +620,140 @@ def run_nen(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
             disable_abbreviations=args.disable_abbreviations,
             batch_size=args.batch_size,
             cpu_threads=args.cpu_threads,
-        )
-
-        progress.emit(
-            stage="normalization",
-            percent=1,
-            message="Indexing unique cell-type mentions without loading the model...",
-            stats=stats,
-            force=True,
+            device=str(getattr(args, "device", "auto") or "auto"),
+            model_identity=(
+                str(getattr(args, "model_identity", "") or "") or None
+            ),
+            progress_callback=report_normalizer_progress,
         )
 
         for paper_index, entry in enumerate(entries, start=1):
-            mentions_path = Path(entry["mentions_path"])
-            document_keys_needing_context: set[str] = set()
-            rows_to_insert: list[tuple[str, str, str]] = []
-            for mention in _iter_jsonl(mentions_path):
-                mention_text = str(mention.get("mention") or "").strip()
-                document_key = str(mention.get("doc_key") or "")
-                if not mention_text:
-                    continue
-                normalized_text = plural_normalize_text(mention_text)
-                rows_to_insert.append((document_key, normalized_text, mention_text))
-                stats["mention_occurrences"] += 1
-                if (
-                    not args.disable_abbreviations
-                    and is_abbreviation_like(mention_text)
-                ):
-                    document_keys_needing_context.add(document_key)
-
-            connection.executemany(
-                "INSERT OR IGNORE INTO requests "
-                "(document_key, normalized_text, mention_text) VALUES (?, ?, ?)",
-                rows_to_insert,
+            chunk_records = list(_iter_jsonl(Path(entry["chunk_path"])))
+            document_key = str(
+                entry.get("paper_identity")
+                or (chunk_records[0].get("doc_key") if chunk_records else "")
+                or (chunk_records[0].get("canonical_id") if chunk_records else "")
+                or f"paper-{paper_index}"
             )
-
-            if document_keys_needing_context:
-                document_texts = _document_text_by_key(Path(entry["chunk_path"]))
-                context_rows: list[tuple[str, str]] = []
-                for document_key in document_keys_needing_context:
-                    lookup = extract_document_abbreviations(
-                        document_texts.get(document_key, "")
-                    )
-                    if lookup:
-                        context_rows.append(
-                            (document_key, json.dumps(lookup, ensure_ascii=False))
-                        )
-                if context_rows:
-                    connection.executemany(
-                        "INSERT OR REPLACE INTO document_abbreviations "
-                        "(document_key, lookup_json) VALUES (?, ?)",
-                        context_rows,
-                    )
-
-            if paper_index % 25 == 0 or paper_index == total_papers:
-                connection.commit()
-                percent = 1 + 14 * paper_index / max(1, total_papers)
-                progress.emit(
-                    stage="normalization",
-                    percent=percent,
-                    message=(
-                        f"Indexed mentions from {paper_index} of {total_papers} papers; "
-                        f"{stats['mention_occurrences']:,} occurrences found."
-                    ),
-                    stats=stats,
-                    force=True,
-                )
-
-        stats["unique_mentions"] = int(
-            connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
-        )
-        stats["documents_with_abbreviation_context"] = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM document_abbreviations"
-            ).fetchone()[0]
-        )
-
-        if stats["unique_mentions"]:
-            progress.emit(
-                stage="normalization",
-                percent=16,
-                message=(
-                    "Loading the CellExLink normalization model and the compact "
-                    "Cell Ontology embedding index..."
-                ),
-                stats=stats,
-                force=True,
-            )
-
-            processed_unique = 0
-            last_document_key: str | None = None
-            last_normalized_text: str | None = None
-            while True:
-                if last_document_key is None:
-                    rows = connection.execute(
-                        "SELECT document_key, normalized_text, mention_text "
-                        "FROM requests ORDER BY document_key, normalized_text LIMIT ?",
-                        (args.request_batch_size,),
-                    ).fetchall()
-                else:
-                    rows = connection.execute(
-                        "SELECT document_key, normalized_text, mention_text FROM requests "
-                        "WHERE document_key > ? "
-                        "OR (document_key = ? AND normalized_text > ?) "
-                        "ORDER BY document_key, normalized_text LIMIT ?",
-                        (
-                            last_document_key,
-                            last_document_key,
-                            last_normalized_text or "",
-                            args.request_batch_size,
-                        ),
-                    ).fetchall()
-                if not rows:
-                    break
-                requests = [
-                    NormalizationRequest(
-                        mention_text=str(row[2]), document_key=str(row[0])
-                    )
-                    for row in rows
-                ]
-                context = _load_context_for_documents(
-                    connection, {request.document_key for request in requests}
-                )
-                linked = normalizer.normalize_batch(
-                    requests,
-                    document_abbreviations=context,
-                )
-                connection.executemany(
-                    "INSERT OR REPLACE INTO results "
-                    "(document_key, normalized_text, result_json) VALUES (?, ?, ?)",
-                    [
-                        (
-                            result.document_key,
-                            result.normalized_text,
-                            json.dumps(
-                                result.to_dict(),
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
-                        )
-                        for result in linked
-                    ],
-                )
-                connection.commit()
-                processed_unique += len(rows)
-                last_document_key = str(rows[-1][0])
-                last_normalized_text = str(rows[-1][1])
-                percent = 16 + 62 * processed_unique / max(
-                    1, stats["unique_mentions"]
-                )
-                progress.emit(
-                    stage="normalization",
-                    percent=percent,
-                    message=(
-                        f"Normalized {processed_unique:,} of "
-                        f"{stats['unique_mentions']:,} unique mentions."
-                    ),
-                    stats=stats,
-                    force=True,
-                )
-        else:
-            progress.emit(
-                stage="normalization",
-                percent=78,
-                message="No recognized cell-type mentions require normalization.",
-                stats=stats,
-                force=True,
-            )
-
-        # Record whether the encoder was needed, then drop it before the final
-        # disk-only join. Empty mention sets never load the NEN checkpoint.
-        stats["model_loaded"] = bool(getattr(normalizer, "model_loaded", False))
-        normalizer.close()
-        normalizer = None
-
-        for paper_index, entry in enumerate(entries, start=1):
+            document = build_document_text(chunk_records, document_key=document_key)
             mentions = list(_iter_jsonl(Path(entry["mentions_path"])))
-            document_keys = sorted(
-                {str(mention.get("doc_key") or "") for mention in mentions}
+            prepass_rows = list(
+                _iter_jsonl(Path(entry["abbreviation_annotations_path"]))
             )
-            result_map: dict[tuple[str, str], dict[str, Any]] = {}
-            for start in range(0, len(document_keys), 400):
-                batch = document_keys[start : start + 400]
-                if not batch:
-                    continue
-                placeholders = ",".join("?" for _ in batch)
-                result_rows = connection.execute(
-                    f"SELECT document_key, normalized_text, result_json FROM results "
-                    f"WHERE document_key IN ({placeholders})",  # noqa: S608
-                    batch,
-                ).fetchall()
-                for document_key, normalized_text, raw_result in result_rows:
-                    try:
-                        payload = json.loads(raw_result)
-                    except json.JSONDecodeError:
-                        payload = {}
-                    result_map[(str(document_key), str(normalized_text))] = payload
+            context = load_document_context(entry["abbreviation_context_path"])
+            stats["ner_mention_occurrences"] += len(mentions)
 
-            output_rows: list[dict[str, Any]] = []
-            paper_normalized = 0
-            paper_unresolved = 0
-            for mention in mentions:
-                document_key = str(mention.get("doc_key") or "")
-                normalized_text = plural_normalize_text(mention.get("mention") or "")
-                output_row = _final_annotation_row(
+            statuses = stats["ab3p_document_statuses"]
+            statuses[context.ab3p_status] = int(
+                statuses.get(context.ab3p_status, 0)
+            ) + 1
+            if context.definitions:
+                stats["documents_with_abbreviation_context"] += 1
+            stats["ab3p_definitions"] += len(context.definitions)
+            stats["validated_ab3p_definitions"] += context.validated_definition_count
+            stats["ab3p_cell_annotations"] += sum(
+                _canonical_entity_type(row) == "cell" for row in prepass_rows
+            )
+            stats["ab3p_hormone_annotations"] += sum(
+                _canonical_entity_type(row) == "hormone" for row in prepass_rows
+            )
+
+            decisions = normalizer.normalize_document_mentions(
+                document=document,
+                mentions=mentions,
+                context=context,
+            )
+            ner_rows = [
+                _annotation_row_from_decision(
                     mention,
-                    result_map.get((document_key, normalized_text)),
+                    decision,
                     nen_model=getattr(args, "model_label", args.model),
                 )
-                if output_row["normalization_status"] == "normalized":
-                    paper_normalized += 1
-                else:
-                    paper_unresolved += 1
-                output_rows.append(output_row)
+                for mention, decision in zip(mentions, decisions)
+                if decision.normalized
+            ]
+            stats["rejected_cell_occurrences"] = int(stats.get("rejected_cell_occurrences", 0)) + sum(not decision.normalized for decision in decisions)
+            output_rows: list[dict[str, Any]] = [
+                *prepass_rows,
+                *ner_rows,
+            ]
+
+            resources = default_cell_span_resources()
+            def validate_source_rows(values: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+                grouped: dict[str, list[Mapping[str, Any]]] = {}
+                for value in values:
+                    grouped.setdefault(str(value.get("chunk_id")), []).append(value)
+                from backend.pipeline.receptor_annotations import reconcile_receptor_annotations
+                return [row for chunk in document.chunks for row in sanitize_source_annotations(
+                    str(chunk.source.get("chunk") or ""),
+                    reconcile_receptor_annotations(str(chunk.source.get("chunk") or ""),
+                        grouped.get(str(chunk.chunk_id), []), matcher=resources.genes),
+                    known_cell=lambda value: resources.resolve_cell(value).status == "resolved_target",
+                    known_gene=lambda value: bool(resources.genes and resources.genes.resolve(value)),
+                    cell_surface_allowed=resources.cell_surface_allowed)]
+
+            # Validate before surface recovery so a false cytokine-as-cell or
+            # receptor fragment can neither hide a gene nor seed propagation.
+            before_validation = len(output_rows)
+            output_rows = validate_source_rows(output_rows)
+            stats["source_span_rejections"] = int(stats.get("source_span_rejections", 0)) + before_validation - len(output_rows)
+            rescued = normalizer.rescue_document_cell_mentions(
+                document=document,
+                accepted_rows=output_rows,
+                context=context,
+            )
+            output_rows.extend(
+                _rescued_annotation_row(
+                    item,
+                    ner_model=manifest["ner_model"],
+                    nen_model=getattr(args, "model_label", args.model),
+                )
+                for item in rescued
+            )
+            before_validation = len(output_rows)
+            output_rows = validate_source_rows(output_rows)
+            stats["source_span_rejections"] += before_validation - len(output_rows)
+            output_rows = _resolve_local_annotation_conflicts(output_rows)
+
+            chunk_order = {
+                chunk.chunk_id: chunk.chunk_order for chunk in document.chunks
+            }
+            output_rows.sort(
+                key=lambda row: _row_sort_key(row, chunk_order=chunk_order)
+            )
+
+            paper_methods: Counter[str] = Counter(
+                str(row.get("normalization_source") or "unresolved")
+                for row in output_rows
+            )
+            aggregate_methods.update(paper_methods)
+            paper_cell_rows = [
+                row for row in output_rows if _canonical_entity_type(row) == "cell"
+            ]
+            paper_hormone_rows = [
+                row for row in output_rows if _canonical_entity_type(row) == "hormone"
+            ]
+            paper_gene_rows = [row for row in output_rows if _canonical_entity_type(row) == "gene"]
+            stats["gene_occurrences"] = int(stats.get("gene_occurrences", 0)) + len(paper_gene_rows)
+            paper_normalized = sum(
+                1
+                for row in paper_cell_rows
+                if row.get("normalization_status") == "normalized"
+            )
+            paper_unresolved = len(paper_cell_rows) - paper_normalized
+            stats["rescued_occurrences"] += len(rescued)
+            stats["mention_occurrences"] += len(output_rows)
+            stats["cell_occurrences"] += len(paper_cell_rows)
+            stats["hormone_occurrences"] += len(paper_hormone_rows)
+            stats["normalized_occurrences"] += paper_normalized
+            stats["unresolved_occurrences"] += paper_unresolved
+
+            for row in output_rows:
+                mention_key = canonical_abbreviation_key(row.get("mention") or "")
+                if mention_key:
+                    unique_mentions.add(
+                        (document_key, f"{_canonical_entity_type(row)}:{mention_key}")
+                    )
 
             annotations_path = Path(entry["annotations_path"])
             annotations_meta_path = Path(entry["annotations_meta_path"])
@@ -705,43 +767,82 @@ def run_nen(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
                     "nen_model": getattr(args, "model_label", args.model),
                     "ontology_version": manifest["ontology_version"],
                     "abbreviation_version": manifest["abbreviation_version"],
+                    "hormone_resource_version": manifest.get(
+                        "hormone_resource_version"
+                    ),
                     "abbreviations_enabled": bool(
                         manifest.get("abbreviations_enabled", True)
                     ),
+                    "normalization_method_log": bool(
+                        getattr(args, "normalization_method_log", False)
+                    ),
                     "source_fingerprint": entry["source_fingerprint"],
                     "source_chunk_path": entry["chunk_path"],
+                    "ner_mention_count": len(mentions),
+                    "ab3p_annotation_count": len(prepass_rows),
+                    "rescued_mention_count": len(rescued),
                     "mention_count": row_count,
+                    "cell_count": len(paper_cell_rows),
+                    "hormone_count": len(paper_hormone_rows),
+                    "gene_count": len(paper_gene_rows),
                     "normalized_count": paper_normalized,
                     "unresolved_count": paper_unresolved,
+                    "ab3p_status": context.ab3p_status,
+                    "ab3p_definition_count": len(context.definitions),
+                    "validated_ab3p_definition_count": (
+                        context.validated_definition_count
+                    ),
+                    "normalization_methods": dict(paper_methods),
                     "completed_at": utc_now(),
                 },
             )
-            stats["papers_processed"] += 1
-            stats["normalized_occurrences"] += paper_normalized
-            stats["unresolved_occurrences"] += paper_unresolved
+
+            if getattr(args, "normalization_method_log", False):
+                _log_document_methods(
+                    document_key=document_key,
+                    ab3p_status=context.ab3p_status,
+                    output_rows=output_rows,
+                    definition_count=len(context.definitions),
+                    validated_definition_count=context.validated_definition_count,
+                )
 
             if not args.keep_ner_intermediates:
                 Path(entry["mentions_path"]).unlink(missing_ok=True)
                 Path(entry["mentions_meta_path"]).unlink(missing_ok=True)
 
-            percent = 78 + 22 * paper_index / max(1, total_papers)
+            stats["papers_processed"] = paper_index
+            stats["unique_mentions"] = len(unique_mentions)
+            stats["normalization_methods"] = dict(aggregate_methods)
+            stats["model_loaded"] = bool(normalizer.model_loaded)
+            stats["normalization_compute_device"] = getattr(normalizer, "compute_device", "not loaded")
+            stats["ontology_embedding_cache_reused"] = (
+                getattr(normalizer, "dictionary_embedding_cache_reused", None)
+            )
+            percent = 70 + 30 * paper_index / max(1, total_papers)
             progress.emit(
                 stage="normalization",
                 percent=percent,
                 message=(
-                    f"Wrote sparse annotations for {paper_index} of {total_papers} papers; "
-                    f"{stats['normalized_occurrences']:,} occurrences normalized."
+                    f"Normalized {paper_index} of {total_papers} papers; "
+                    f"{stats['normalized_occurrences']:,} cell occurrences linked, "
+                    f"{stats['hormone_occurrences']:,} hormone occurrences retained, "
+                    f"and {stats['rescued_occurrences']:,} cell spans propagated."
                 ),
                 stats=stats,
                 force=True,
             )
 
+        stats["model_loaded"] = bool(normalizer.model_loaded)
+        stats["normalization_compute_device"] = getattr(normalizer, "compute_device", "not loaded")
+        stats["ontology_embedding_cache_reused"] = (
+            getattr(normalizer, "dictionary_embedding_cache_reused", None)
+        )
         progress.emit(
             stage="normalization",
             percent=100,
             message=(
                 f"Normalization complete: {stats['normalized_occurrences']:,} "
-                "cell-type occurrences linked to Cell Ontology."
+                "cell occurrences processed with thresholded vector fallback."
             ),
             stats=stats,
             force=True,
@@ -749,11 +850,12 @@ def run_nen(args: Any, manifest: dict[str, Any], progress: ProgressSink) -> dict
         return stats
     finally:
         if normalizer is not None:
+            stats["model_loaded"] = bool(normalizer.model_loaded)
+            stats["normalization_compute_device"] = getattr(normalizer, "compute_device", "not loaded")
+            stats["ontology_embedding_cache_reused"] = (
+                getattr(normalizer, "dictionary_embedding_cache_reused", None)
+            )
             normalizer.close()
-        connection.close()
-        for suffix in ("", "-wal", "-shm"):
-            Path(str(work_database_path) + suffix).unlink(missing_ok=True)
 
 
-
-__all__ = ["run_ner", "run_nen", "utc_now"]
+__all__ = ["run_abbreviation_prepass", "run_ner", "run_nen", "utc_now"]
