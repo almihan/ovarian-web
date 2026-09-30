@@ -352,10 +352,18 @@ class PipelineOrchestrator:
         ):
             shutil.rmtree(path, ignore_errors=True)
             path.mkdir(parents=True, exist_ok=True)
-        try:
-            get_artifact_store().delete_prefix(prefixed_key("runs"))
-        except Exception as exc:
-            logger.warning("Could not remove old temporary run artifacts: %s", exc)
+        if settings.artifact_backend == "local":
+            try:
+                get_artifact_store().delete_prefix(prefixed_key("runs"))
+            except Exception as exc:
+                logger.warning("Could not remove old temporary run artifacts: %s", exc)
+        else:
+            # Serving /health must not wait for a bucket connection or retries.
+            # Remote runs are removed by per-run expiry or bucket lifecycle rules.
+            logger.info(
+                "Skipping remote temporary-run cleanup during startup; "
+                "use per-run expiry cleanup or bucket lifecycle expiration."
+            )
 
     def shutdown(self) -> None:
         for run_id in {run_id for run_id, _stage in tuple(self._running)}:
@@ -377,10 +385,16 @@ class PipelineOrchestrator:
         shutdown = getattr(annotation_coordinator, "shutdown", None)
         if callable(shutdown):
             shutdown()
-        try:
-            get_artifact_store().delete_prefix(prefixed_key("runs"))
-        except Exception as exc:
-            logger.warning("Could not remove temporary run artifacts: %s", exc)
+        if settings.artifact_backend == "local":
+            try:
+                get_artifact_store().delete_prefix(prefixed_key("runs"))
+            except Exception as exc:
+                logger.warning("Could not remove temporary run artifacts: %s", exc)
+        else:
+            logger.info(
+                "Skipping remote temporary-run cleanup during shutdown; "
+                "use per-run expiry cleanup or bucket lifecycle expiration."
+            )
         shutil.rmtree(settings.data_dir / "runs", ignore_errors=True)
         shutil.rmtree(settings.data_dir / "work", ignore_errors=True)
         run_registry.clear()

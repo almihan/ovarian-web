@@ -63,10 +63,15 @@ _VENDOR_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
 async def lifespan(app: FastAPI):
     del app
     logger.info("[ENTITY_OVERLAP_POLICY] policy=%s", ENTITY_OVERLAP_POLICY)
+    logger.info("Startup: preparing saved corpora in %s", settings.precomputed_corpora_dir)
     ensure_corpus_store()
+    logger.info("Startup: preparing reference files in %s", settings.reference_data_cache_dir)
     seed_reference_resources()
+    logger.info("Startup: initializing temporary pipeline state")
     pipeline_orchestrator.initialize()
+    logger.info("Startup: initializing monthly update state (enabled=%s)", settings.monthly_updates_enabled)
     corpus_update_service.initialize()
+    logger.info("Startup complete: saved-results website is ready")
     try:
         yield
     finally:
