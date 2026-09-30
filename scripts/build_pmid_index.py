@@ -3,6 +3,7 @@
 Usage:
     python scripts/build_pmid_index.py
     python scripts/build_pmid_index.py --store-dir data/precomputed_corpora
+we have changed    
 """
 
 from __future__ import annotations
